@@ -1,0 +1,973 @@
+use std::borrow::Cow;
+use std::cmp::{max};
+use std::error::Error;
+use std::io::{self};
+use std::ops::Range;
+use std::{fmt, str};
+
+const MAX_STATE_STACK_SIZE: usize = 65_536;
+
+#[derive(Eq, PartialEq, Debug, Clone, Hash)]
+pub enum JSONEvent<'a> {
+    String(Cow<'a, str>),
+    Number(Cow<'a, str>),
+    Boolean(bool),
+    Null,
+    StartArray,
+    EndArray,
+    StartObject,
+    EndObject,
+    ObjectKey(Cow<'a, str>),
+    Eof,
+}
+pub struct JSONEventGenerator {
+    lexer: JSONLexer,
+    state_stack: Vec<JSONState>,
+    max_state_stack_size: usize,
+    element_read: bool,
+    buffered_event: Option<JSONEvent<'static>>,
+}
+
+impl JSONEventGenerator {
+    pub const fn new() -> Self {
+        Self {
+            lexer: JSONLexer {
+                file_offset: 0,
+                file_line: 0,
+                file_start_of_last_line: 0,
+                file_start_of_last_token: 0,
+                is_start: true,
+            },
+            state_stack: Vec::new(),
+            max_state_stack_size: MAX_STATE_STACK_SIZE,
+            element_read: false,
+            buffered_event: None,
+        }
+    }
+
+    /// Maximal allowed number of nested object and array openings. Infinite by default.
+    pub fn with_max_stack_size(mut self, size: usize) -> Self {
+        self.max_state_stack_size = size;
+        self
+    }
+
+    /// Reads a new event from the data in `input_buffer`.
+    ///
+    /// `is_ending` must be set to true if all the JSON data have been already consumed or are in `input_buffer`.
+    pub fn parse_next<'a>(
+        &mut self,
+        input_buffer: &'a [u8],
+        is_ending: bool,
+    ) -> JSONEventWrapper<'a> {
+        if let Some(event) = self.buffered_event.take() {
+            return JSONEventWrapper {
+                consumed_bytes: 0,
+                event: Some(Ok(event)),
+            };
+        }
+        let start_file_offset = self.lexer.file_offset;
+        while let Some(token) = self.lexer.read_next_token(
+            &input_buffer[usize::try_from(self.lexer.file_offset - start_file_offset).unwrap()..],
+            is_ending,
+        ) {
+            let consumed_bytes = (self.lexer.file_offset - start_file_offset)
+                .try_into()
+                .unwrap();
+            match token {
+                Ok(token) => {
+                    let (event, error) = self.apply_new_token(token);
+                    let error = error.map(|e| {
+                        self.lexer.syntax_error(
+                            self.lexer.file_start_of_last_token..self.lexer.file_offset,
+                            e,
+                        )
+                    });
+                    if let Some(error) = error {
+                        self.buffered_event = event.map(owned_event);
+                        return JSONEventWrapper {
+                            consumed_bytes,
+                            event: Some(Err(error)),
+                        };
+                    }
+                    if let Some(event) = event {
+                        return JSONEventWrapper {
+                            consumed_bytes,
+                            event: Some(Ok(event)),
+                        };
+                    }
+                }
+                Err(error) => {
+                    return JSONEventWrapper {
+                        consumed_bytes,
+                        event: Some(Err(error)),
+                    }
+                }
+            }
+        }
+        JSONEventWrapper {
+            consumed_bytes: (self.lexer.file_offset - start_file_offset)
+                .try_into()
+                .unwrap(),
+            event: if is_ending {
+                self.buffered_event = Some(JSONEvent::Eof);
+                Some(Err(self.lexer.syntax_error(
+                    self.lexer.file_offset..self.lexer.file_offset + 1,
+                    "Unexpected end of file",
+                )))
+            } else {
+                None
+            },
+        }
+    }
+
+    #[deprecated(note = "Use parse_next() instead")]
+    pub fn read_next_event<'a>(
+        &mut self,
+        input_buffer: &'a [u8],
+        is_ending: bool,
+    ) -> JSONEventWrapper<'a> {
+        self.parse_next(input_buffer, is_ending)
+    }
+
+    fn apply_new_token<'a>(
+        &mut self,
+        token: JSONToken<'a>,
+    ) -> (Option<JSONEvent<'a>>, Option<String>) {
+        match self.state_stack.pop() {
+            Some(JSONState::ObjectKeyOrEnd) => {
+                if token == JSONToken::ClosingCurlyBracket {
+                    (Some(JSONEvent::EndObject), None)
+                } else {
+                    if let Err(e) = self.push_state_stack(JSONState::ObjectKey) {
+                        return (None, Some(e));
+                    }
+                    self.apply_new_token(token)
+                }
+            }
+            Some(JSONState::ObjectKey) => {
+                if token == JSONToken::ClosingCurlyBracket {
+                    return (Some(JSONEvent::EndObject), Some("Trailing commas are not allowed".into()));
+                }
+                if let Err(e) = self.push_state_stack(JSONState::ObjectColon) {
+                    return (None, Some(e));
+                }
+                if let JSONToken::String(key) = token {
+                    (Some(JSONEvent::ObjectKey(key)), None)
+                } else {
+                    (None, Some("Object keys must be strings".into()))
+                }
+            }
+            Some(JSONState::ObjectColon) => {
+                if let Err(e) = self.push_state_stack(JSONState::ObjectValue) {
+                    return (None, Some(e));
+                }
+                if token == JSONToken::Colon {
+                    (None, None)
+                } else {
+                    let (event, _) = self.apply_new_token(token);
+                    (event, Some("Object keys must be followed by a colon ':'".into()))
+                }
+            }
+            Some(JSONState::ObjectValue) => {
+                if let Err(e) = self.push_state_stack(JSONState::ObjectCommaOrEnd) {
+                    return (None, Some(e));
+                }
+                self.apply_new_token_for_value(token)
+            }
+            Some(JSONState::ObjectCommaOrEnd) => match token {
+                JSONToken::Comma => {
+                    (None, self.push_state_stack(JSONState::ObjectKey).err())
+                }
+                JSONToken::ClosingCurlyBracket => (Some(JSONEvent::EndObject), None),
+                _ => (None, Some("Object values must be followed by a comma to add a new value or a curly bracket to end the object".into())),
+            },
+            Some(JSONState::ArrayValueOrEnd) =>{
+                if token == JSONToken::ClosingSquareBracket {
+                    return (Some(JSONEvent::EndArray), None);
+                }
+                if let Err(e) = self.push_state_stack(JSONState::ArrayValue) {
+                    return (None, Some(e));
+                }
+                self.apply_new_token(token)
+            }
+            Some(JSONState::ArrayValue) => {
+                if token == JSONToken::ClosingSquareBracket {
+                    return (Some(JSONEvent::EndArray), Some("Trailing commas are not allowed".into()));
+                }
+                if let Err(e) = self.push_state_stack(JSONState::ArrayCommaOrEnd) {
+                    return (None, Some(e));
+                }
+                self.apply_new_token_for_value(token)
+            }
+            Some(JSONState::ArrayCommaOrEnd) => match token {
+                JSONToken::Comma => {
+                    (None, self.push_state_stack(JSONState::ArrayValue).err())
+                }
+                JSONToken::ClosingSquareBracket => (Some(JSONEvent::EndArray), None),
+                _ => {
+                    let _ = self.push_state_stack(JSONState::ArrayValue); // We already have an error
+                    let (event, _) = self.apply_new_token(token);
+                    (event, Some("Array values must be followed by a comma to add a new value or a squared bracket to end the array".into()))
+                }
+            }
+            None => if self.element_read {
+                if token == JSONToken::Eof {
+                    (Some(JSONEvent::Eof), None)
+                } else {
+                    (None, Some("The JSON already contains one root element".into()))
+                }
+            } else {
+                self.element_read = true;
+                self.apply_new_token_for_value(token)
+            }
+        }
+    }
+
+    fn apply_new_token_for_value<'a>(
+        &mut self,
+        token: JSONToken<'a>,
+    ) -> (Option<JSONEvent<'a>>, Option<String>) {
+        match token {
+            JSONToken::OpeningSquareBracket => (
+                Some(JSONEvent::StartArray),
+                self.push_state_stack(JSONState::ArrayValueOrEnd).err(),
+            ),
+            JSONToken::ClosingSquareBracket => (
+                None,
+                Some("Unexpected closing square bracket, no array to close".into()),
+            ),
+            JSONToken::OpeningCurlyBracket => (
+                Some(JSONEvent::StartObject),
+                self.push_state_stack(JSONState::ObjectKeyOrEnd).err(),
+            ),
+            JSONToken::ClosingCurlyBracket => (
+                None,
+                Some("Unexpected closing curly bracket, no array to close".into()),
+            ),
+            JSONToken::Comma => (None, Some("Unexpected comma, no values to separate".into())),
+            JSONToken::Colon => (None, Some("Unexpected colon, no key to follow".into())),
+            JSONToken::String(string) => (Some(JSONEvent::String(string)), None),
+            JSONToken::Number(number) => (Some(JSONEvent::Number(number)), None),
+            JSONToken::True => (Some(JSONEvent::Boolean(true)), None),
+            JSONToken::False => (Some(JSONEvent::Boolean(false)), None),
+            JSONToken::Null => (Some(JSONEvent::Null), None),
+            JSONToken::Eof => (
+                Some(JSONEvent::Eof),
+                Some("Unexpected end of file, a value was expected".into()),
+            ),
+        }
+    }
+
+    fn push_state_stack(&mut self, state: JSONState) -> Result<(), String> {
+        self.check_stack_size()?;
+        self.state_stack.push(state);
+        Ok(())
+    }
+
+    fn check_stack_size(&self) -> Result<(), String> {
+        if self.state_stack.len() > self.max_state_stack_size {
+            Err(format!(
+                "Max stack size of {} reached on an object opening",
+                self.max_state_stack_size
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Default for JSONEventGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Eq, PartialEq, Copy, Clone, Debug)]
+enum JSONState {
+    ObjectKey,
+    ObjectKeyOrEnd,
+    ObjectColon,
+    ObjectValue,
+    ObjectCommaOrEnd,
+    ArrayValue,
+    ArrayValueOrEnd,
+    ArrayCommaOrEnd,
+}
+
+#[derive(Eq, PartialEq, Clone, Debug)]
+enum JSONToken<'a> {
+    OpeningSquareBracket, // [
+    ClosingSquareBracket, // ]
+    OpeningCurlyBracket,  // {
+    ClosingCurlyBracket,  // }
+    Comma,                // ,
+    Colon,                // :
+    String(Cow<'a, str>), // "..."
+    Number(Cow<'a, str>), // 1.2e3
+    True,                 // true
+    False,                // false
+    Null,                 // null
+    Eof,                  // EOF
+}
+
+struct JSONLexer {
+    file_offset: u64,
+    file_line: u64,
+    file_start_of_last_line: u64,
+    file_start_of_last_token: u64,
+    is_start: bool,
+}
+
+impl JSONLexer {
+    fn read_next_token<'a>(
+        &mut self,
+        mut input_buffer: &'a [u8],
+        is_ending: bool,
+    ) -> Option<Result<JSONToken<'a>, JSONSyntaxError>> {
+        // We remove BOM at the beginning
+        if self.is_start {
+            if input_buffer.len() < 3 && !is_ending {
+                return None;
+            }
+            self.is_start = false;
+            if input_buffer.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                input_buffer = &input_buffer[3..];
+                self.file_offset += 3;
+            }
+        }
+
+        // We skip whitespaces
+        let mut i = 0;
+        while let Some(c) = input_buffer.get(i) {
+            match *c {
+                b' ' | b'\t' => {
+                    i += 1;
+                }
+                b'\n' => {
+                    i += 1;
+                    self.file_line += 1;
+                    self.file_start_of_last_line = self.file_offset + u64::try_from(i).unwrap();
+                }
+                b'\r' => {
+                    i += 1;
+                    if let Some(c) = input_buffer.get(i) {
+                        if *c == b'\n' {
+                            i += 1; // \r\n
+                        }
+                    } else if !is_ending {
+                        // We need an extra byte to check if followed by \n
+                        i -= 1;
+                        self.file_offset += u64::try_from(i).unwrap();
+                        return None;
+                    }
+                    self.file_line += 1;
+                    self.file_start_of_last_line = self.file_offset + u64::try_from(i).unwrap();
+                }
+                _ => {
+                    break;
+                }
+            }
+        }
+        self.file_offset += u64::try_from(i).unwrap();
+        input_buffer = &input_buffer[i..];
+        self.file_start_of_last_token = self.file_offset;
+
+        if is_ending && input_buffer.is_empty() {
+            return Some(Ok(JSONToken::Eof));
+        }
+
+        // we get the first character
+        match *input_buffer.first()? {
+            b'{' => {
+                self.file_offset += 1;
+                Some(Ok(JSONToken::OpeningCurlyBracket))
+            }
+            b'}' => {
+                self.file_offset += 1;
+                Some(Ok(JSONToken::ClosingCurlyBracket))
+            }
+            b'[' => {
+                self.file_offset += 1;
+                Some(Ok(JSONToken::OpeningSquareBracket))
+            }
+            b']' => {
+                self.file_offset += 1;
+                Some(Ok(JSONToken::ClosingSquareBracket))
+            }
+            b',' => {
+                self.file_offset += 1;
+                Some(Ok(JSONToken::Comma))
+            }
+            b':' => {
+                self.file_offset += 1;
+                Some(Ok(JSONToken::Colon))
+            }
+            b'"' => self.read_string(input_buffer),
+            b't' => self.read_constant(input_buffer, is_ending, "true", JSONToken::True),
+            b'f' => self.read_constant(input_buffer, is_ending, "false", JSONToken::False),
+            b'n' => self.read_constant(input_buffer, is_ending, "null", JSONToken::Null),
+            b'-' | b'0'..=b'9' => self.read_number(input_buffer, is_ending),
+            c => {
+                self.file_offset += 1;
+                Some(Err(self.syntax_error(
+                    self.file_offset - 1..self.file_offset,
+                    if c < 128 {
+                        format!("Unexpected char: '{}'", char::from(c))
+                    } else {
+                        format!("Unexpected byte: \\x{c:X}")
+                    },
+                )))
+            }
+        }
+    }
+
+    fn read_string<'a>(
+        &mut self,
+        input_buffer: &'a [u8],
+    ) -> Option<Result<JSONToken<'a>, JSONSyntaxError>> {
+        let mut error = None;
+        let mut string: Option<(String, usize)> = None;
+        let mut next_byte_offset = 1;
+        loop {
+            match *input_buffer.get(next_byte_offset)? {
+                b'"' => {
+                    // end of string
+                    let result = Some(if let Some(error) = error {
+                        Err(error)
+                    } else if let Some((mut string, read_until)) = string {
+                        if read_until < next_byte_offset {
+                            let (str, e) = self.decode_utf8(
+                                &input_buffer[read_until..next_byte_offset],
+                                self.file_offset + u64::try_from(read_until).unwrap(),
+                            );
+                            error = error.or(e);
+                            string.push_str(&str);
+                        }
+                        if let Some(error) = error {
+                            Err(error)
+                        } else {
+                            Ok(JSONToken::String(Cow::Owned(string)))
+                        }
+                    } else {
+                        let (string, error) = self
+                            .decode_utf8(&input_buffer[1..next_byte_offset], self.file_offset + 1);
+                        if let Some(error) = error {
+                            Err(error)
+                        } else {
+                            Ok(JSONToken::String(string))
+                        }
+                    });
+                    self.file_offset += u64::try_from(next_byte_offset).unwrap() + 1;
+                    return result;
+                }
+                b'\\' => {
+                    // Escape sequences
+                    if string.is_none() {
+                        string = Some((String::new(), 1))
+                    }
+                    let (string, read_until) = string.as_mut().unwrap();
+                    if *read_until < next_byte_offset {
+                        let (str, e) = self.decode_utf8(
+                            &input_buffer[*read_until..next_byte_offset],
+                            self.file_offset + u64::try_from(*read_until).unwrap(),
+                        );
+                        error = error.or(e);
+                        string.push_str(&str);
+                    }
+                    next_byte_offset += 1;
+                    match *input_buffer.get(next_byte_offset)? {
+                        b'"' => {
+                            string.push('"');
+                            next_byte_offset += 1;
+                        }
+                        b'\\' => {
+                            string.push('\\');
+                            next_byte_offset += 1;
+                        }
+                        b'/' => {
+                            string.push('/');
+                            next_byte_offset += 1;
+                        }
+                        b'b' => {
+                            string.push('\u{8}');
+                            next_byte_offset += 1;
+                        }
+                        b'f' => {
+                            string.push('\u{C}');
+                            next_byte_offset += 1;
+                        }
+                        b'n' => {
+                            string.push('\n');
+                            next_byte_offset += 1;
+                        }
+                        b'r' => {
+                            string.push('\r');
+                            next_byte_offset += 1;
+                        }
+                        b't' => {
+                            string.push('\t');
+                            next_byte_offset += 1;
+                        }
+                        b'u' => {
+                            next_byte_offset += 1;
+                            let val = input_buffer.get(next_byte_offset..next_byte_offset + 4)?;
+                            next_byte_offset += 4;
+                            let code_point = match read_hexa_char(val) {
+                                Ok(cp) => cp,
+                                Err(e) => {
+                                    error = error.or_else(|| {
+                                        let pos = self.file_offset
+                                            + u64::try_from(next_byte_offset).unwrap();
+                                        Some(self.syntax_error(pos - 4..pos, e))
+                                    });
+                                    char::REPLACEMENT_CHARACTER.into()
+                                }
+                            };
+                            if let Some(c) = char::from_u32(code_point) {
+                                string.push(c);
+                            } else {
+                                let high_surrogate = code_point;
+                                if !(0xD800..=0xDBFF).contains(&high_surrogate) {
+                                    error = error.or_else(|| {
+                                        let pos = self.file_offset
+                                            + u64::try_from(next_byte_offset).unwrap();
+                                        Some(self.syntax_error(
+                                            pos - 6..pos,
+                                            format!(
+                                                "\\u{:X} is not a valid high surrogate",
+                                                high_surrogate
+                                            ),
+                                        ))
+                                    });
+                                }
+                                let val =
+                                    input_buffer.get(next_byte_offset..next_byte_offset + 6)?;
+                                next_byte_offset += 6;
+                                if !val.starts_with(b"\\u") {
+                                    error = error.or_else(|| {
+                                        let pos = self.file_offset + u64::try_from(next_byte_offset).unwrap();
+                                        Some(self.syntax_error(
+                                            pos - 6..pos,
+                                            format!(
+                                                "\\u{:X} is a high surrogate and should be followed by a low surrogate \\uXXXX",
+                                                high_surrogate
+                                            )
+                                        ))
+                                    });
+                                }
+                                let low_surrogate = match read_hexa_char(&val[2..]) {
+                                    Ok(cp) => cp,
+                                    Err(e) => {
+                                        error = error.or_else(|| {
+                                            let pos = self.file_offset
+                                                + u64::try_from(next_byte_offset).unwrap();
+                                            Some(self.syntax_error(pos - 6..pos, e))
+                                        });
+                                        char::REPLACEMENT_CHARACTER.into()
+                                    }
+                                };
+                                if !(0xDC00..=0xDFFF).contains(&low_surrogate) {
+                                    error = error.or_else(|| {
+                                        let pos = self.file_offset
+                                            + u64::try_from(next_byte_offset).unwrap();
+                                        Some(self.syntax_error(
+                                            pos - 6..pos,
+                                            format!(
+                                                "\\u{:X} is not a valid low surrogate",
+                                                low_surrogate
+                                            ),
+                                        ))
+                                    });
+                                }
+                                let code_point = 0x10000
+                                    + ((high_surrogate & 0x03FF) << 10)
+                                    + (low_surrogate & 0x03FF);
+                                if let Some(c) = char::from_u32(code_point) {
+                                    string.push(c)
+                                } else {
+                                    string.push(char::REPLACEMENT_CHARACTER);
+                                    error = error.or_else(|| {
+                                        let pos = self.file_offset
+                                            + u64::try_from(next_byte_offset).unwrap();
+                                        Some(self.syntax_error(
+                                            pos - 12..pos,
+                                            format!(
+                                                "\\u{:X}\\u{:X} is an invalid surrogate pair",
+                                                high_surrogate, low_surrogate
+                                            ),
+                                        ))
+                                    });
+                                }
+                            }
+                        }
+                        c => {
+                            next_byte_offset += 1;
+                            error = error.or_else(|| {
+                                let pos =
+                                    self.file_offset + u64::try_from(next_byte_offset).unwrap();
+                                Some(self.syntax_error(
+                                    pos - 2..pos,
+                                    format!("'\\{}' is not a valid escape sequence", char::from(c)),
+                                ))
+                            });
+                            string.push(char::REPLACEMENT_CHARACTER);
+                        }
+                    }
+                    *read_until = next_byte_offset;
+                }
+                c @ (0..=0x1F) => {
+                    error = error.or_else(|| {
+                        let pos = self.file_offset + u64::try_from(next_byte_offset).unwrap();
+                        Some(self.syntax_error(
+                            pos..pos + 1,
+                            format!("'{}' is not allowed in JSON strings", char::from(c)),
+                        ))
+                    });
+                    next_byte_offset += 1;
+                }
+                _ => {
+                    next_byte_offset += 1;
+                }
+            }
+        }
+    }
+
+    fn read_constant(
+        &mut self,
+        input_buffer: &[u8],
+        is_ending: bool,
+        expected: &str,
+        value: JSONToken<'static>,
+    ) -> Option<Result<JSONToken<'static>, JSONSyntaxError>> {
+        if input_buffer.get(..expected.len())? == expected.as_bytes() {
+            self.file_offset += u64::try_from(expected.len()).unwrap();
+            return Some(Ok(value));
+        }
+        let ascii_chars = input_buffer
+            .iter()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .count();
+        if ascii_chars == input_buffer.len() && !is_ending {
+            return None; // We might read a bigger token
+        }
+        let read = max(1, ascii_chars); // We want to consume at least a byte
+        let start_offset = self.file_offset;
+        self.file_offset += u64::try_from(read).unwrap();
+        Some(Err(self.syntax_error(
+            start_offset..self.file_offset,
+            format!("{} expected", expected),
+        )))
+    }
+
+    fn read_number<'a>(
+        &mut self,
+        input_buffer: &'a [u8],
+        is_ending: bool,
+    ) -> Option<Result<JSONToken<'a>, JSONSyntaxError>> {
+        let mut next_byte_offset = 0;
+        if *input_buffer.get(next_byte_offset)? == b'-' {
+            next_byte_offset += 1;
+        }
+        // integer starting with first bytes
+        match *input_buffer.get(next_byte_offset)? {
+            b'0' => {
+                next_byte_offset += 1;
+            }
+            b'1'..=b'9' => {
+                next_byte_offset += 1;
+                next_byte_offset += read_digits(&input_buffer[next_byte_offset..], is_ending)?;
+            }
+            c => {
+                next_byte_offset += 1;
+                self.file_offset += u64::try_from(next_byte_offset).unwrap();
+                return Some(Err(self.syntax_error(
+                    self.file_offset - 1..self.file_offset,
+                    format!("A number is not allowed to start with '{}'", char::from(c)),
+                )));
+            }
+        }
+
+        // Dot
+        if input_buffer.get(next_byte_offset).map_or_else(
+            || if is_ending { Some(None) } else { None },
+            |c| Some(Some(*c)),
+        )? == Some(b'.')
+        {
+            next_byte_offset += 1;
+            let c = *input_buffer.get(next_byte_offset)?;
+            next_byte_offset += 1;
+            if !c.is_ascii_digit() {
+                self.file_offset += u64::try_from(next_byte_offset).unwrap();
+                return Some(Err(self.syntax_error(
+                    self.file_offset - 1..self.file_offset,
+                    format!(
+                        "A number fractional part must start with a digit and not '{}'",
+                        char::from(c)
+                    ),
+                )));
+            }
+            next_byte_offset += read_digits(&input_buffer[next_byte_offset..], is_ending)?;
+        }
+
+        // Exp
+        let c = input_buffer.get(next_byte_offset).map_or_else(
+            || if is_ending { Some(None) } else { None },
+            |c| Some(Some(*c)),
+        )?;
+        if c == Some(b'e') || c == Some(b'E') {
+            next_byte_offset += 1;
+            match *input_buffer.get(next_byte_offset)? {
+                b'-' | b'+' => {
+                    next_byte_offset += 1;
+                    let c = *input_buffer.get(next_byte_offset)?;
+                    next_byte_offset += 1;
+                    if !c.is_ascii_digit() {
+                        self.file_offset += u64::try_from(next_byte_offset).unwrap();
+                        return Some(Err(self.syntax_error(
+                            self.file_offset - 1..self.file_offset,
+                            format!(
+                                "A number exponential part must contain at least a digit, '{}' found",
+                                char::from(c)
+                            ),
+                        )));
+                    }
+                }
+                b'0'..=b'9' => {
+                    next_byte_offset += 1;
+                }
+                c => {
+                    next_byte_offset += 1;
+                    self.file_offset += u64::try_from(next_byte_offset).unwrap();
+                    return Some(Err(self.syntax_error(
+                        self.file_offset - 1..self.file_offset,
+                        format!(
+                            "A number exponential part must start with +, - or a digit, '{}' found",
+                            char::from(c)
+                        ),
+                    )));
+                }
+            }
+            next_byte_offset += read_digits(&input_buffer[next_byte_offset..], is_ending)?;
+        }
+        self.file_offset += u64::try_from(next_byte_offset).unwrap();
+        Some(Ok(JSONToken::Number(Cow::Borrowed(
+            str::from_utf8(&input_buffer[..next_byte_offset]).unwrap(),
+        ))))
+    }
+
+    fn decode_utf8<'a>(
+        &self,
+        input_buffer: &'a [u8],
+        start_position: u64,
+    ) -> (Cow<'a, str>, Option<JSONSyntaxError>) {
+        match str::from_utf8(input_buffer) {
+            Ok(str) => (Cow::Borrowed(str), None),
+            Err(e) => (
+                String::from_utf8_lossy(input_buffer),
+                Some({
+                    let pos = start_position + u64::try_from(e.valid_up_to()).unwrap();
+                    self.syntax_error(pos..pos + 1, format!("Invalid UTF-8: {e}"))
+                }),
+            ),
+        }
+    }
+
+    fn syntax_error(&self, file_offset: Range<u64>, message: impl Into<String>) -> JSONSyntaxError {
+        let start_file_offset = max(file_offset.start, self.file_start_of_last_line);
+        JSONSyntaxError {
+            location: TextPosition {
+                line: self.file_line,
+                column: start_file_offset - self.file_start_of_last_line, // TODO: unicode
+                offset: start_file_offset,
+            }..TextPosition {
+                line: self.file_line,
+                column: file_offset.end - self.file_start_of_last_line, // TODO: unicode
+                offset: file_offset.end,
+            },
+            message: message.into(),
+        }
+    }
+}
+
+fn read_hexa_char(input: &[u8]) -> Result<u32, String> {
+    let mut value = 0;
+    for c in input.iter().copied() {
+        value = value * 16
+            + match c {
+                b'0'..=b'9' => u32::from(c) - u32::from(b'0'),
+                b'a'..=b'f' => u32::from(c) - u32::from(b'a') + 10,
+                b'A'..=b'F' => u32::from(c) - u32::from(b'A') + 10,
+                _ => {
+                    return Err(format!(
+                        "Unexpected character in a unicode escape: '{}'",
+                        char::from(c)
+                    ))
+                }
+            }
+    }
+    Ok(value)
+}
+
+fn read_digits(input_buffer: &[u8], is_ending: bool) -> Option<usize> {
+    let count = input_buffer
+        .iter()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    if count == input_buffer.len() && !is_ending {
+        return None;
+    }
+    Some(count)
+}
+
+fn owned_event(event: JSONEvent<'_>) -> JSONEvent<'static> {
+    match event {
+        JSONEvent::String(s) => JSONEvent::String(s.into_owned().into()),
+        JSONEvent::Number(n) => JSONEvent::Number(n.into_owned().into()),
+        JSONEvent::Boolean(b) => JSONEvent::Boolean(b),
+        JSONEvent::Null => JSONEvent::Null,
+        JSONEvent::StartArray => JSONEvent::StartArray,
+        JSONEvent::EndArray => JSONEvent::EndArray,
+        JSONEvent::StartObject => JSONEvent::StartObject,
+        JSONEvent::EndObject => JSONEvent::EndObject,
+        JSONEvent::ObjectKey(k) => JSONEvent::ObjectKey(k.into_owned().into()),
+        JSONEvent::Eof => JSONEvent::Eof,
+    }
+}
+
+/// Result of [`LowLevelJsonParser::parse_next`].
+#[derive(Debug)]
+pub struct JSONEventWrapper<'a> {
+    /// How many bytes have been read from `input_buffer` and should be removed from it.
+    pub consumed_bytes: usize,
+    /// A possible new event
+    pub event: Option<Result<JSONEvent<'a>, JSONSyntaxError>>,
+}
+
+/// A position in a text i.e. a `line` number starting from 0, a `column` number starting from 0 (in number of code points) and a global file `offset` starting from 0 (in number of bytes).
+#[derive(Eq, PartialEq, Debug, Clone, Copy)]
+pub struct TextPosition {
+    pub line: u64,
+    pub column: u64,
+    pub offset: u64,
+}
+
+/// An error in the syntax of the parsed file.
+///
+/// It is composed of a message and a byte range in the input.
+#[derive(Debug)]
+pub struct JSONSyntaxError {
+    location: Range<TextPosition>,
+    message: String,
+}
+
+impl JSONSyntaxError {
+    /// The location of the error inside of the file.
+    #[inline]
+    pub fn location(&self) -> Range<TextPosition> {
+        self.location.clone()
+    }
+
+    /// The error message.
+    #[inline]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for JSONSyntaxError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.location.start.offset + 1 >= self.location.end.offset {
+            write!(
+                f,
+                "Parser error at line {} column {}: {}",
+                self.location.start.line + 1,
+                self.location.start.column + 1,
+                self.message
+            )
+        } else if self.location.start.line == self.location.end.line {
+            write!(
+                f,
+                "Parser error at line {} between columns {} and column {}: {}",
+                self.location.start.line + 1,
+                self.location.start.column + 1,
+                self.location.end.column + 1,
+                self.message
+            )
+        } else {
+            write!(
+                f,
+                "Parser error between line {} column {} and line {} column {}: {}",
+                self.location.start.line + 1,
+                self.location.start.column + 1,
+                self.location.end.line + 1,
+                self.location.end.column + 1,
+                self.message
+            )
+        }
+    }
+}
+
+impl Error for JSONSyntaxError {}
+
+impl From<JSONSyntaxError> for io::Error {
+    #[inline]
+    fn from(error: JSONSyntaxError) -> Self {
+        io::Error::new(io::ErrorKind::InvalidData, error)
+    }
+}
+
+/// A parsing error.
+///
+/// It is the union of [`JsonSyntaxError`] and [`std::io::Error`].
+#[derive(Debug)]
+pub enum JSONParseError {
+    /// I/O error during parsing (file not found...).
+    Io(io::Error),
+    /// An error in the file syntax.
+    Syntax(JSONSyntaxError),
+}
+
+impl fmt::Display for JSONParseError {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(e) => e.fmt(f),
+            Self::Syntax(e) => e.fmt(f),
+        }
+    }
+}
+
+impl Error for JSONParseError {
+    #[inline]
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(match self {
+            Self::Io(e) => e,
+            Self::Syntax(e) => e,
+        })
+    }
+}
+
+impl From<JSONSyntaxError> for JSONParseError {
+    #[inline]
+    fn from(error: JSONSyntaxError) -> Self {
+        Self::Syntax(error)
+    }
+}
+
+impl From<io::Error> for JSONParseError {
+    #[inline]
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<JSONParseError> for io::Error {
+    #[inline]
+    fn from(error: JSONParseError) -> Self {
+        match error {
+            JSONParseError::Syntax(e) => e.into(),
+            JSONParseError::Io(e) => e,
+        }
+    }
+}

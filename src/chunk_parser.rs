@@ -225,7 +225,7 @@ impl JSONChunkParser {
         return self.tracked_fields[name].clone();
     }
 
-    pub fn to_json(&mut self) -> Value {
+    pub fn get_result_json(&mut self) -> Value {
         for (_, tracker) in &self.tracked_fields {
             if let Some(output_key) = &tracker.output_key {
                 if let Some(value) = self.matches_found.get(&tracker.json_path) {
@@ -420,6 +420,10 @@ impl JSONPathTracker {
 
     fn has_data(&self) -> bool {
         return self.collect_buffer.len() > 0;
+    }
+
+    pub fn get_value(&self) -> String {
+        return String::from_utf8_lossy(&self.collect_buffer).into_owned();
     }
 
     fn reset(&mut self) {

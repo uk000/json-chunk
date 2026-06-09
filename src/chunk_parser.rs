@@ -72,7 +72,6 @@ impl JSONChunkParser {
 
         let mut cursor = 0;
         let mut short_circuit = false;
-
         loop {
             let slice_to_parse = &self.scratch_buffer[cursor..];
             let JSONEventWrapper {
@@ -85,10 +84,8 @@ impl JSONChunkParser {
 
             let ev = match event {
                 None => {
-                    // No event produced, but bytes may have been consumed (e.g. a ':' or ','
-                    // token that precedes the next value and straddles a chunk boundary).
+                    // No event produced, but bytes may have been consumed (e.g. a ':' or ',')
                     // Append those bytes to any active collect_buffers so they are not lost
-                    // when scratch_buffer is drained.
                     if consumed_bytes > 0 {
                         self.feed_trackers(&b);
                     }
@@ -98,7 +95,6 @@ impl JSONChunkParser {
                 Some(Ok(ev)) => ev,
             };
 
-            // ── Extract owned data before mutably borrowing trackers ─────────────
             let obj_key: Option<String> = if let JSONEvent::ObjectKey(k) = &ev {
                 Some(k.to_string())
             } else {
@@ -120,22 +116,14 @@ impl JSONChunkParser {
                 break;
             }
 
-            // ── Fan the event out to every path tracker independently ─────────────
-            // let mut chunk_matches: Vec<(usize, String)> = Vec::new();
-
             for (_, tracker) in &mut self.tracked_fields {
                 // Per-tracker early exit: skip trackers that already found their match.
                 if tracker.done {
                     continue;
                 }
-                // scratch_buffer and fields_to_search are disjoint fields; both borrows
-                // are valid simultaneously under Rust's split-borrow rules.
                 //If a tracker is already collecting, let it collect current chunk too.
                 if tracker.is_collecting() {
                     tracker.collect(&b, false);
-                    // If we're buffering a child JSON blob, accumulate bytes for this event
-                    // THEN adjust the nesting depth.  The closing } or ] must land in the
-                    // buffer before we emit the result.
                     tracker.move_collect_pointers(
                         is_start_object,
                         is_end_object,
@@ -145,8 +133,6 @@ impl JSONChunkParser {
 
                     if !tracker.is_collecting() {
                         tracker.finish();
-                        //     let json_str = String::from_utf8_lossy(&tracker.collect_buffer).into_owned();
-                        //     chunk_matches.push((i, json_str));
                     }
                     continue;
                 }
@@ -179,15 +165,9 @@ impl JSONChunkParser {
                     if tracker.will_collect() {
                         tracker.collect(v.as_bytes(), true);
                         tracker.finish();
-                        // if !tracker.overflow {
-                        //     chunk_matches.push((i, v.clone()));
-                        // }
                     }
                 }
             }
-
-            // Mark each matched tracker as done (per-tracker stop) and collect results.
-            // self.store_chunk_matches(chunk_matches);
 
             // Short-circuit the outer parse loop only when ALL trackers are done.
             if self.is_all_done() {
@@ -340,7 +320,6 @@ impl JSONPathTracker {
         if self.skipped_depth > 0 {
             self.skipped_depth += 1;
         } else if self.matched_depth < self.path_vector.len()
-            && !k.is_empty()
             && k == self.path_vector[self.matched_depth]
         {
             if self.matched_depth == self.path_vector.len() - 1 {
@@ -414,11 +393,10 @@ impl JSONPathTracker {
     }
 
     fn match_key(&mut self, k: String) -> bool {
-        if k.is_empty() {
+        if k.is_empty() && !self.path_vector[self.matched_depth].is_empty() {
             return false;
         }
-        if self.matched_depth < self.path_vector.len() && k == self.path_vector[self.matched_depth]
-        {
+        if self.matched_depth < self.path_vector.len() && k == self.path_vector[self.matched_depth] {
             if self.matched_depth == self.path_vector.len() - 1 {
                 // Path terminates at this object key – collect the whole subtree.
                 // Use cursor-1..cursor to capture only the '{' itself, not any
@@ -431,7 +409,6 @@ impl JSONPathTracker {
                 return false;
             }
         } else {
-            // empty key = root object, pass through
             self.skipped_depth += 1;
             return false;
         }

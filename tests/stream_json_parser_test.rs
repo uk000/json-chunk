@@ -1,6 +1,6 @@
 use std::collections::{HashMap};
 use std::sync::{LazyLock, Mutex};
-use serde_json::Value;
+use serde_json::{json, Value};
 use json_chunk::parser::{JSONEvent, JSONEventGenerator, JSONEventWrapper};
 
 
@@ -16,12 +16,62 @@ use super::*;
   fn create_parser(paths: HashMap<String, (Option<String>, usize)>) -> JSONChunkParser {
     let mut parser = JSONChunkParser::default();
     for (path, value) in paths {
-      if path.is_empty() {
-          continue;
-      }
       parser.add_search_field(path, value.0, value.1);
     }
     parser
+  }
+
+  #[test]
+  fn test_object_with_empty_fields() {
+    let json_bytes = build_small_json(3, 10);
+
+    // Multiple target paths to find simultaneously during streaming.
+    let path_map = HashMap::from([
+        ("metadata.".to_string(), (Some("metadata".to_string()), 100)),
+        ("metadata.stats.details.locale".to_string(), (Some("locale".to_string()), 100)),
+        ("config.key".to_string(), (None, 100)),
+        ("config.values.value2".to_string(), (Some("value".to_string()), 0)),
+        ("timestamp".to_string(), (None,10)),
+        (".".to_string(), (Some("default".to_string()),100)),
+    ]);
+
+    let expected: HashMap<String, Value> = HashMap::from([
+        ("metadata".to_string(), extract_json_value(&json_bytes, &["metadata",""])),
+        ("locale".to_string(), extract_json_value(&json_bytes, &["metadata","stats","details","locale"])),
+        ("config.key".to_string(), extract_json_value(&json_bytes, &["config","key"])),
+        ("value".to_string(), extract_json_value(&json_bytes, &["config","values","value2"])),
+        ("timestamp".to_string(), extract_json_value(&json_bytes, &["timestamp"])),
+        ("default".to_string(), extract_json_value(&json_bytes, &[""])),
+    ]);
+
+    let (all_names, successors) = get_expected_field_names(&path_map);
+    // Split at random boundaries between 50 and 300 bytes (seed = 42).
+    let chunks = random_chunks(json_bytes, 10, 50, 42, true, &all_names);
+    print_relevant_chunks(&all_names, &successors, &chunks);
+    
+    let total: usize = chunks.len();
+    let mut parser = create_parser(path_map);
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("Processing chunk {}/{} bytes {}", i+1, chunks.len(), chunk.len());
+        parser.process_chunk(chunk, i == total - 1);
+        if parser.is_all_found() {
+            break
+        }
+    }
+    println!("expected ({}):", expected.len());
+    print_mapjson_summary(&expected, false);
+    println!("parser.matches_found ({}):", parser.matches_found.len());
+    print_mapjson_summary(&parser.matches_found, false);
+    assert_eq!(parser.is_all_found(), true);
+    assert_eq!(parser.get_field("metadata.stats.details.locale").overflow, false);
+    assert_eq!(parser.get_field("config.key").overflow, false);
+    assert_eq!(parser.get_field("config.values.value2").overflow, false);
+    assert_eq!(parser.get_field("timestamp").overflow, false);
+    let json = parser.to_json();
+    println!("Result JSON:");
+    print_json_summary(&json, false);
+    assert_eq!(json, serde_json::to_value(expected).unwrap());
+  
   }
 
   #[test]
@@ -46,6 +96,7 @@ use super::*;
     let total: usize = chunks.len();
     let mut parser = create_parser(path_map);
     for (i, chunk) in chunks.iter().enumerate() {
+        println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
         parser.process_chunk(chunk, i == total - 1);
         if parser.is_all_found() {
             break
@@ -89,6 +140,7 @@ use super::*;
     let total: usize = chunks.len();
     let mut parser = create_parser(path_map);
     for (i, chunk) in chunks.iter().enumerate() {
+        println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
         parser.process_chunk(chunk, i == total - 1);
         if parser.is_all_found() {
             break
@@ -125,6 +177,7 @@ use super::*;
     let total: usize = chunks.len();
     let mut parser = create_parser(path_map);
     for (i, chunk) in chunks.iter().enumerate() {
+        println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
         parser.process_chunk(chunk, i == total - 1);
         if parser.is_all_found() {
             break
@@ -157,8 +210,14 @@ use super::*;
     // Split at random boundaries between 50 and 300 bytes (seed = 42).
     let chunks = random_chunks(json_bytes, 50, 300, 42, false, &all_names);
     let mut parser = create_parser(path_map);
-    parser.process_chunks(&chunks);
-
+    let total: usize = chunks.len();
+    for (i, chunk) in chunks.iter().enumerate() {
+        println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
+        parser.process_chunk(chunk, i == total - 1);
+        if parser.is_all_found() {
+            break
+        }
+    }
     println!("expected ({}):", expected.len());
     print_mapjson_summary(&expected, false);
     println!("parser.matches_found ({}):", parser.matches_found.len());
@@ -191,6 +250,7 @@ use super::*;
     let total: usize = chunks.len();
     let mut parser = create_parser(path_map);
     for (i, chunk) in chunks.iter().enumerate() {
+        println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
         parser.process_chunk(chunk, i == total - 1);
         if parser.is_all_found() {
             break
@@ -201,50 +261,41 @@ use super::*;
     println!("parser.matches_found ({}):", parser.matches_found.len());
     print_mapjson_summary(&parser.matches_found, false);
     assert_eq!(parser.is_all_found(), false);
+    assert_eq!(parser.get_field("metadata.stats.details.locale").overflow, true);
     let json = parser.to_json();
     println!("Result JSON:");
     print_json_summary(&json, false);
-    assert_eq!(json, serde_json::to_value(expected).unwrap());
+    assert_ne!(json, serde_json::to_value(expected).unwrap());
   }
 }
 
-// ── Test helpers ─────────────────────────────────────────────────────────────
-/// Build a large JSON object that mixes:
-/// - `field_count` flat scalar string fields (`field_0` … `field_{N-1}`)
-/// - A nested `metadata` object (3 levels deep)
-/// - A `tags` array of strings
-/// - An `items` array of objects
-/// - A `config` nested object (2 levels deep)
-/// - A `keywords` array of strings
-///
-/// `field_count` also controls how many elements the arrays contain.
-/// `value_len` sets the length of every string value.
-fn build_large_json(field_count: usize, value_len: usize) -> Vec<u8> {
-    let v = |ch: char| -> String { format!("\"{}\"", rep(ch, value_len)) };
+fn v(ch: char, value_len: usize) -> String { 
+    format!("\"{}\"", rep(ch, value_len))
+}
 
-    // ── flat scalar fields: field_0 … field_{N-1} ───────────────────────────
+fn build_flat_fields(field_count: usize, value_len: usize) -> String {
     let mut flat_fields = String::new();
     for i in 0..field_count {
         let ch = (b'a' + (i % 26) as u8) as char;
-        flat_fields.push_str(&format!("\"field_{i}\":{}", v(ch)));
+        flat_fields.push_str(&format!("\"field_{i}\":{}", v(ch, value_len)));
         flat_fields.push(',');
     }
-    // flat_fields always ends with ',' — the nested section follows
+    flat_fields
+}
 
-    // ── array of strings ────────────────────────────────────────────────────
-    let str_array = |ch: char| -> String {
-        let items: Vec<String> = (0..field_count).map(|_| v(ch)).collect();
-        format!("[ {}  
-        ]", items.join(","))
-    };
+fn str_array(ch: char, item_count: usize, value_len: usize) -> String {
+    let items: Vec<String> = (0..item_count).map(|_| v(ch, value_len)).collect();
+    format!("[ {} ]", items.join(","))
+}
 
-    // ── array of objects ────────────────────────────────────────────────────
-    let obj_array = |kch: char, vch: char| -> String {
-        let items: Vec<String> = (0..field_count)
-            .map(|_| format!("{{\"name\":{},\"value\":{}}}", v(kch), v(vch)))
-            .collect();
-        format!("[{}]", items.join(","))
-    };
+fn obj_array(kch: char, vch: char, item_count: usize, value_len: usize) -> String {
+    let items: Vec<String> = (0..item_count)
+        .map(|_| format!("{{\"name\":{},\"value\":{}}}", v(kch, value_len), v(vch, value_len)))
+        .collect();
+    format!("[ {} ]", items.join(","))
+}
+
+fn set_larger_json_successors() {
     *SUCCESSORS.lock().unwrap() = [
         ("field_0", "field_1"),
         ("field_1", "field_2"),
@@ -294,19 +345,37 @@ fn build_large_json(field_count: usize, value_len: usize) -> Vec<u8> {
         ("signature", "timestamp"),
     ]
     .into_iter().collect();
+}
+
+// ── Test helpers ─────────────────────────────────────────────────────────────
+/// Build a large JSON object that mixes:
+/// - `field_count` flat scalar string fields (`field_0` … `field_{N-1}`)
+/// - A nested `metadata` object (3 levels deep)
+/// - A `tags` array of strings
+/// - An `items` array of objects
+/// - A `config` nested object (2 levels deep)
+/// - A `keywords` array of strings
+///
+/// `field_count` also controls how many elements the arrays contain.
+/// `value_len` sets the length of every string value.
+fn build_large_json(field_count: usize, value_len: usize) -> Vec<u8> {
+    // ── flat scalar fields: field_0 … field_{N-1} ───────────────────────────
+    let flat_fields = build_flat_fields(field_count, value_len);
+    // flat_fields always ends with ',' — the nested section follows
+    set_larger_json_successors();
 
     let json = format!(
         concat!(
             "{{",
             "{flat}",                   // field_0 … field_{N-1} (each ending with ',')
-            "\"metadata\":{{",          // depth 1
-              "\"author\":{author},",
-              "\"version\":{version},",
-              "\"stats\":{{",           // depth 2
-                "\"views\":{views},",
-                "\"details\":{{",       // depth 3
-                  "\"regions\":{regions},",
-                  "\"locale\":{locale}",
+            "\"metadata\" : {{",          // depth 1
+              "\"author\" :  {author},",
+              "\"version\" :  {version},",
+              " \"stats\" :  {{",           // depth 2
+                "  \"views\":{views},",
+                "  \"details\":{{",       // depth 3
+                  "  \"regions\":{regions},",
+                  "  \"locale\":{locale}",
                 "}}",
               "}},",
               "\"name\":{name}",
@@ -325,18 +394,87 @@ fn build_large_json(field_count: usize, value_len: usize) -> Vec<u8> {
             "}}"
         ),
         flat     = flat_fields,
-        author   = v('A'),
-        version  = v('B'),
-        views    = obj_array('C', 'D'),
-        regions   = str_array('E'),
-        locale   = v('F'),
-        name   = v('G'),
-        tags     = str_array('H'),
-        items    = obj_array('I', 'J'),
-        key  = v('K'),
-        value1      = v('L'),
-        value2      = v('M'),
-        signature = str_array('N'),
+        author   = v('A', value_len),
+        version  = v('B', value_len),
+        views    = obj_array('C', 'D', field_count, value_len),
+        regions   = str_array('E', field_count, value_len),
+        locale   = v('F', value_len),
+        name   = v('G', value_len),
+        tags     = str_array('H', field_count, value_len),
+        items    = obj_array('I', 'J', field_count, value_len),
+        key  = v('K', value_len),
+        value1      = v('L', value_len),
+        value2      = v('M', value_len),
+        signature = str_array('N', field_count, value_len),
+        timestamp = 123456,
+    );
+    println!("=== JSON structure ===");
+    let json_bytes = json.into_bytes();
+    print_json_structure(&json_bytes);
+    println!("=== end structure ===\n");
+    json_bytes
+}
+
+fn build_small_json(field_count: usize, value_len: usize) -> Vec<u8> {
+    *SUCCESSORS.lock().unwrap() = [
+        ("metadata", "author"),
+        ("author", "version"),
+        ("version", "stats"),
+        ("stats", "views"),
+        ("views", "details"),
+        ("details", "regions"),
+        ("regions", "locale"),
+        ("locale", "name"),
+        ("name", "tags"),
+        ("tags", "items"),
+        ("items", "config"),
+        ("config", "key"),
+        ("key", "values"),
+        ("values", "signature"),
+        ("signature", "timestamp"),
+    ]
+    .into_iter().collect();
+
+    let json = format!(
+        concat!(
+            "{{",
+            " \"metadata\" :  {{",          // depth 1
+              "   \"\"  :   {author}  ,",
+              "\"version\":{version},",
+              "\"stats\":{{",           // depth 2
+                "\"views\":{views},",
+                " \"details\" :   {{  ",       // depth 3
+                  "  \"regions\"   :   {regions},",
+                  "  \"locale\"   :  {locale}  ",
+                "}}",
+              "}},",
+              "\"name\":{name}",
+            "}},",
+            "\"\":{tags},",
+            "\"items\":{items},",
+            "\"config\":{{",            // depth 1
+              "\"key\":{key},",
+              "\"values\":{{",          // depth 2
+                "\"value1\":{value1},",
+                "\"value2\":{value2}",
+              "}}",
+            "}},",
+            "\"signature\":{signature},",
+            "\"timestamp\":{timestamp}",
+            "}}"
+        ),
+        author   = v('A', value_len),
+        version  = v('B', value_len),
+        views    = obj_array('C', 'D', field_count, value_len),
+        regions   = str_array('E', field_count, value_len),
+        locale   = v('F', value_len),
+        name   = v('G', value_len),
+        tags     = str_array('H', field_count, value_len),
+        items    = obj_array('I', 'J', field_count, value_len),
+        key  = v('K', value_len),
+        value1      = v('L', value_len),
+        value2      = v('M', value_len),
+        signature = str_array('N', field_count, value_len),
         timestamp = 123456,
     );
     println!("=== JSON structure ===");
@@ -389,22 +527,18 @@ fn random_chunks(bytes: Vec<u8>, min: usize, max: usize, seed: u64, split_random
     chunks
 }
 
+fn bytes_to_value(b: &Vec<u8>) -> Value {
+    return serde_json::from_slice::<Value>(&b).unwrap_or_default();
+}
+
 fn build_expected(path_map: &HashMap<String, (Option<String>, usize)>, json_bytes: &Vec<u8>) -> HashMap<String, Value> {
     let mut expected : HashMap<String, Value> = HashMap::new();
     // Derive expected values by navigating each path in the full JSON.
     for (json_path, output) in path_map {
         let fields_vec: Vec<&str> = json_path.split('.').collect();
-        let b = extract_json_value(&json_bytes, &fields_vec);
-        if let Some(b) = b {
-            // b is a Vec<u8>; try parsing it as JSON bytes, fallback to treating as raw string
-            match serde_json::from_slice::<Value>(&b) {
-                Ok(json_value) => {
-                    expected.insert(output.clone().0.unwrap_or(json_path.to_string()), json_value);
-                }
-                Err(_e) => {
-                    println!("Error: {}, Bytes {:?}", _e, b)
-                }
-            }
+        let json_value = extract_json_value(&json_bytes, &fields_vec);
+        if !json_value.is_null() {
+            expected.insert(output.clone().0.unwrap_or(json_path.to_string()), json_value);
         }
     }
     expected
@@ -432,9 +566,9 @@ fn get_expected_field_names(path_map: &HashMap<String, (Option<String>, usize)>)
 /// - Scalar leaf (string / number / bool): returned as its text value.
 /// - Object or array at the terminal key: the full raw JSON substring is returned.
 /// - Arrays that do *not* appear as the terminal path component are skipped.
-fn extract_json_value(bytes: &[u8], path: &[&str]) -> Option<Vec<u8>> {
+fn extract_json_value(bytes: &[u8], path: &[&str]) -> Value {
     if path.is_empty() {
-        return None;
+        return json!(null);
     }
     let mut parser = JSONEventGenerator::new();
     let mut cursor = 0usize;
@@ -496,9 +630,7 @@ fn extract_json_value(bytes: &[u8], path: &[&str]) -> Option<Vec<u8>> {
                     if collecting_depth > 0 {
                         collecting_depth -= 1;
                         if collecting_depth == 0 {
-                            return Some(
-                                bytes[collect_start..cursor].to_vec()
-                            );
+                            return bytes_to_value(&bytes[collect_start..cursor].to_vec());
                         }
                     } else {
                         if skipped_depth > 0 {
@@ -538,9 +670,7 @@ fn extract_json_value(bytes: &[u8], path: &[&str]) -> Option<Vec<u8>> {
                     if collecting_depth > 0 {
                         collecting_depth -= 1;
                         if collecting_depth == 0 {
-                            return Some(
-                                bytes[collect_start..cursor].to_vec()
-                            );
+                            return bytes_to_value(&bytes[collect_start..cursor].to_vec());
                         }
                     } else if skipped_depth > 0 {
                         skipped_depth -= 1;
@@ -553,7 +683,7 @@ fn extract_json_value(bytes: &[u8], path: &[&str]) -> Option<Vec<u8>> {
                         && matched_depth == path.len() - 1
                         && pending_key.as_deref() == Some(path[matched_depth])
                     {
-                        return Some(serde_json::to_vec(&val.as_ref()).unwrap_or_default());
+                        return bytes_to_value(&serde_json::to_vec(&val.as_ref()).unwrap_or_default());
                     }
                     if collecting_depth == 0 {
                         pending_key = None;
@@ -566,7 +696,7 @@ fn extract_json_value(bytes: &[u8], path: &[&str]) -> Option<Vec<u8>> {
                         && matched_depth == path.len() - 1
                         && pending_key.as_deref() == Some(path[matched_depth])
                     {
-                        return Some(val.into_owned().into_bytes());
+                        return bytes_to_value(&val.into_owned().into_bytes());
                     }
                     if collecting_depth == 0 {
                         pending_key = None;
@@ -579,7 +709,7 @@ fn extract_json_value(bytes: &[u8], path: &[&str]) -> Option<Vec<u8>> {
                         && matched_depth == path.len() - 1
                         && pending_key.as_deref() == Some(path[matched_depth])
                     {
-                        return Some(if val { b"true".to_vec() } else { b"false".to_vec() });
+                        return bytes_to_value(&if val { b"true".to_vec() } else { b"false".to_vec() });
                     }
                     if collecting_depth == 0 {
                         pending_key = None;
@@ -594,7 +724,7 @@ fn extract_json_value(bytes: &[u8], path: &[&str]) -> Option<Vec<u8>> {
             },
         }
     }
-    None
+    json!(null)
 }
 
 /// Minimal LCG so we don't need the `rand` crate.
@@ -619,7 +749,10 @@ fn print_json_structure(bytes: &[u8]) {
     let take_label = |pending_key: &mut Option<String>,
                       stack: &mut Vec<(bool, usize)>|
      -> String {
-        if let Some(k) = pending_key.take() {
+        if let Some(mut k) = pending_key.take() {
+            if k == "" {
+                k = "\"\"".to_string();
+            }
             format!("{k}: ")
         } else if let Some((true, idx)) = stack.last_mut() {
             let i = *idx;
@@ -678,7 +811,7 @@ fn print_json_structure(bytes: &[u8]) {
                         let n = chars.len().min(3);
                         chars[chars.len() - n..].iter().collect()
                     };
-                    println!("{}{label}: \"{start}...{len}...{end}\"", ind(stack.len()));
+                    println!("{}{label}\"{start}...{len}...{end}\"", ind(stack.len()));
                 }
 
                 JSONEvent::Number(val) => {
@@ -701,29 +834,37 @@ fn print_json_structure(bytes: &[u8]) {
 }
 
 fn find_and_print_key_in_chunk(key: &str, chunk: &Vec<u8>, next_chunk: &Vec<u8>, chunk_idx: usize, overlap: bool, prefix: &str) -> bool {
-  if key == "" {
-    return false;
-  }
-  let content = String::from_utf8_lossy(chunk);
-  let mut search_content = content.clone();
-  if let Some(s) = search_content.find(key) {
-    let end = (s + key.len()+10).min(content.len());
-    println!(" {prefix} field {:?} in chunk[{}] ({} bytes): {}", key, chunk_idx, chunk.len(), &content[..end]);
-    return true;
-  }
-  if overlap {
-    let mut joined = Vec::with_capacity(20.min(chunk.len()) + next_chunk.len());
-    let overlap_end = (key.len() + 20).min(next_chunk.len()); 
-    let next_content = String::from_utf8_lossy(&next_chunk[..overlap_end]);
-    joined.extend_from_slice(&chunk);
-    joined.extend_from_slice(&next_chunk[..overlap_end]);
-    search_content = String::from_utf8_lossy(&joined);
-    if let Some(_) = search_content.find(key) {
-      println!(" {prefix} field {:?} across chunks[{},{}] : [{}] [{}]", key, chunk_idx, chunk_idx+1, &content, &next_content);
-      return true;
+    if key == "" {
+        return false;
     }
-  }
-  false
+    let mut field = "field";
+    if prefix != "" {
+        field = prefix;
+    }
+    let content = String::from_utf8_lossy(chunk);
+    let mut search_content = content.clone();
+    if let Some(s) = search_content.find(key) {
+        let end = (s + key.len()+10).min(content.len());
+        // fixed width columns: | prefix | field | chunk_idx | chunk_len | snippet
+        println!("| {:<15} | {:<20} | {:>15} | {:>15} | ```{}```",
+            field, key, chunk_idx, "", &content[..end]);
+        return true;
+    }
+    if overlap {
+        let mut joined = Vec::with_capacity(20.min(chunk.len()) + next_chunk.len());
+        let overlap_end = (key.len() + 20).min(next_chunk.len()); 
+        let next_content = String::from_utf8_lossy(&next_chunk[..overlap_end]);
+        joined.extend_from_slice(&chunk);
+        joined.extend_from_slice(&next_chunk[..overlap_end]);
+        search_content = String::from_utf8_lossy(&joined);
+        if let Some(_) = search_content.find(key) {
+            // across chunks: show both parts in fixed columns
+            println!("| {:<15} | {:<20} | {:>15} | {:>15} | ```{}```  >>>>  ```{}```",
+                field, key, chunk_idx, chunk_idx+1, &content, &next_content);
+            return true;
+        }
+    }
+    false
 }
 
 fn find_and_print_in_single_or_overlap(key: &str, chunks: &Vec<Vec<u8>>, chunk_idx: usize, total: usize, prefix: &str) -> bool {
@@ -744,9 +885,11 @@ fn find_and_print_in_single_or_overlap(key: &str, chunks: &Vec<Vec<u8>>, chunk_i
 
 fn print_relevant_chunks(all_names: &Vec<&str>, successors: &HashMap<&str, &str>, chunks: &Vec<Vec<u8>>) {
     let total: usize = chunks.len();
-    println!("\nchunks ({} total, showing only chunks containing target fields {:?}):", total, all_names);
+    println!("\nOut of {} chunks, showing only chunks containing target fields {:?}:", total, all_names);
 
     let mut matched_successors: Vec<&&str> = Vec::new();
+    println!("| {:<15} | {:<20} | {:>15} | {:>15} | {}",
+            "kind", "field name", "from chunk", "split to ", "chunk");
     for (i, _) in chunks.iter().enumerate() {
       for name in all_names.iter() {
         if find_and_print_in_single_or_overlap(name, chunks, i, total, "") {
@@ -754,7 +897,7 @@ fn print_relevant_chunks(all_names: &Vec<&str>, successors: &HashMap<&str, &str>
         }
       }
       for name in matched_successors.clone().iter() {
-        if find_and_print_in_single_or_overlap(name, chunks, i, total, " >>>> successor") {
+        if find_and_print_in_single_or_overlap(name, chunks, i, total, "successor") {
           matched_successors.remove(0);
         }
       }
@@ -763,7 +906,7 @@ fn print_relevant_chunks(all_names: &Vec<&str>, successors: &HashMap<&str, &str>
 }
 
 fn print_kv(k: &String, v: &Value, all: bool) {
-    let value = serde_json::to_string_pretty(&v).unwrap();
+    let value = serde_json::to_string(&v).unwrap();
     let len = value.len()-2;
     if all || len < 10 {
         println!("  {k}: {value}");
@@ -779,8 +922,12 @@ fn print_kv(k: &String, v: &Value, all: bool) {
 }
 
 fn print_mapjson_summary(json : &HashMap<String, Value>, all: bool) {
+    let empty: String = "\"\"".to_string();
     println!("{{");
-    for (k, v) in json.iter() {
+    for (mut k, v) in json.iter() {
+        if k == "" {
+            k = &empty;
+        }
         print_kv(k, v, all);
     }
     println!("}}");

@@ -1,7 +1,7 @@
 use crate::parser::{JSONEvent, JSONEventGenerator, JSONEventWrapper};
 use serde_json::Value;
 use std::fmt;
-use std::{collections::HashMap, mem};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct JSONPathTracker {
@@ -34,12 +34,15 @@ pub struct JSONChunkParser {
     pub tracked_fields: HashMap<String, JSONPathTracker>,
     /// Results collected, keyed by either matched path or overridden path.
     pub matches_found: HashMap<String, Value>,
+    pub done_fields: HashSet<String>,
+    pub overflowed_fields: HashSet<String>,
 }
 
 impl JSONChunkParser {
     pub fn add_search_field(&mut self, json_path: String, output: Option<String>, max_size: usize) {
         let key = json_path.clone();
         let path = json_path.split('.').map(String::from).collect();
+
         let tracker = JSONPathTracker {
             json_path,
             path_vector: path,
@@ -124,6 +127,10 @@ impl JSONChunkParser {
                 //If a tracker is already collecting, let it collect current chunk too.
                 if tracker.is_collecting() {
                     tracker.collect(&b, false);
+                    if tracker.overflow {
+                        self.overflowed_fields.insert(tracker.json_path.to_owned());
+                        tracker.reset(true);
+                    }
                     tracker.move_collect_pointers(
                         is_start_object,
                         is_end_object,
@@ -133,6 +140,9 @@ impl JSONChunkParser {
 
                     if !tracker.is_collecting() {
                         tracker.finish();
+                        if !tracker.overflow {
+                            self.done_fields.insert(tracker.json_path.to_owned());
+                        }
                     }
                     continue;
                 }
@@ -164,6 +174,12 @@ impl JSONChunkParser {
                     //check with tracker again if interested in collecting now
                     if tracker.will_collect() {
                         tracker.collect(v.as_bytes(), true);
+                        if tracker.overflow {
+                            self.overflowed_fields.insert(tracker.json_path.to_owned());
+                            tracker.reset(true);
+                        } else {
+                            self.done_fields.insert(tracker.json_path.to_owned());
+                        }
                         tracker.finish();
                     }
                 }
@@ -186,7 +202,10 @@ impl JSONChunkParser {
 
     fn end_tracking(&mut self) {
         for (_, tracker) in &mut self.tracked_fields {
-            tracker.finish();
+            if !tracker.done && !tracker.overflow && tracker.has_data() {
+                tracker.finish();
+                self.done_fields.insert(tracker.json_path.to_owned());
+            }
             if tracker.has_data() {
                 let buf = &tracker.collect_buffer;
                 let json_value = match buf.first() {
@@ -210,19 +229,27 @@ impl JSONChunkParser {
     fn feed_trackers(&mut self, b: &[u8]) {
         for (_, tracker) in &mut self.tracked_fields {
             tracker.collect(b, false);
+            if tracker.overflow {
+                self.overflowed_fields.insert(tracker.json_path.to_owned());
+                tracker.reset(true);
+            }
         }
     }
 
     pub fn is_all_done(&self) -> bool {
-        self.stop_at_first_match && self.tracked_fields.iter().all(|(_, t)| t.done)
+        self.stop_at_first_match && self.tracked_fields.iter().all(|(_, t)| t.done||t.overflow)
     }
 
     pub fn is_all_found(&self) -> bool {
-        self.tracked_fields.len() == self.matches_found.len()
+        self.tracked_fields.len() == self.done_fields.len() + self.overflowed_fields.len()
     }
 
-    pub fn get_field(&self, name: &str) -> JSONPathTracker {
-        return self.tracked_fields[name].clone();
+    pub fn get_field(&self, name: &str) -> &JSONPathTracker {
+        self.tracked_fields.get(name).expect("field not found")
+    }
+
+    pub fn get_matches(&self) -> &HashMap<String, Value> {
+        &self.matches_found
     }
 
     pub fn get_result_json(&mut self) -> Value {
@@ -234,8 +261,7 @@ impl JSONChunkParser {
                 }
             }
         }
-        let taken_map = mem::take(&mut self.matches_found);
-        let json = serde_json::to_value(taken_map).unwrap();
+        let json = serde_json::to_value(&mut self.matches_found).unwrap();
         json
     }
 }
@@ -248,6 +274,8 @@ impl Default for JSONChunkParser {
             tracked_fields: HashMap::new(),
             stop_at_first_match: true,
             matches_found: HashMap::new(),
+            overflowed_fields: HashSet::new(),
+            done_fields: HashSet::new(),
         }
     }
 }
@@ -261,6 +289,8 @@ impl Clone for JSONChunkParser {
             tracked_fields: self.tracked_fields.clone(),
             stop_at_first_match: self.stop_at_first_match,
             matches_found: self.matches_found.clone(),
+            overflowed_fields: self.overflowed_fields.clone(),
+            done_fields: self.done_fields.clone(),
         }
     }
 }
@@ -304,7 +334,6 @@ impl JSONPathTracker {
         if will_collect {
             self.collect_buffer.extend_from_slice(b);
             if (self.max_value_length > 0) && (self.collect_buffer.len() > self.max_value_length) {
-                self.reset();
                 self.overflow = true;
             }
         }
@@ -423,10 +452,10 @@ impl JSONPathTracker {
     }
 
     pub fn get_value(&self) -> String {
-        return String::from_utf8_lossy(&self.collect_buffer).into_owned();
+        return String::from_utf8_lossy(&self.collect_buffer).to_string();
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self, overflow: bool) {
         self.matched_depth = 0;
         self.array_nesting = 0;
         self.skipped_depth = 0;
@@ -434,6 +463,6 @@ impl JSONPathTracker {
         self.done = false;
         self.collecting_depth = 0;
         self.collect_buffer.clear();
-        self.overflow = false;
+        self.overflow = overflow;
     }
 }

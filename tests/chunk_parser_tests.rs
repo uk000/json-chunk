@@ -2,271 +2,338 @@ use std::collections::{HashMap};
 use std::sync::{LazyLock, Mutex};
 use serde_json::{json, Value};
 use json_chunk::parser::{JSONEvent, JSONEventGenerator, JSONEventWrapper};
-
+use json_chunk::chunk_parser::JSONChunkParser;
 
 static SUCCESSORS: LazyLock<Mutex<HashMap<&'static str, &'static str>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
 mod tests {
 
-use json_chunk::chunk_parser::JSONChunkParser;
-
 use super::*;
 
-  fn create_parser(paths: HashMap<String, (Option<String>, usize)>) -> JSONChunkParser {
-    let mut parser = JSONChunkParser::default();
-    for (path, value) in paths {
-      parser.add_search_field(path, value.0, value.1);
+  #[test]
+    fn test_short_circuit_early_finish() {
+        let json_bytes = build_large_json(10, 10, false);
+
+        // Multiple target paths to find simultaneously during streaming.
+        let path_map: HashMap<String, (Option<String>, usize)> = HashMap::from([
+            ("field_0".to_string(), (None, 100)),
+        ]);
+        test_happy_paths(&json_bytes, &path_map);
+
+        // Multiple target paths to find simultaneously during streaming.
+        let path_map: HashMap<String, (Option<String>, usize)> = HashMap::from([
+            ("field_0".to_string(), (None, 100)),
+            ("field_9".to_string(), (None, 100)),
+        ]);
+        test_happy_paths(&json_bytes, &path_map);
+
+        // Multiple target paths to find simultaneously during streaming.
+        let path_map: HashMap<String, (Option<String>, usize)> = HashMap::from([
+            ("field_0".to_string(), (None, 100)),
+            ("field_9".to_string(), (None, 100)),
+            ("metadata.author".to_string(), (None, 100)),
+        ]);
+        test_happy_paths(&json_bytes, &path_map);
     }
-    parser
-  }
+
+    #[test]
+    fn test_object_with_empty_fields() {
+        let json_bytes = build_small_json(3, 10);
+
+        // Multiple target paths to find simultaneously during streaming.
+        let path_map = HashMap::from([
+            ("metadata.".to_string(), (Some("metadata".to_string()), 100)),
+            ("metadata.stats.details.locale".to_string(), (Some("locale".to_string()), 100)),
+            ("config.key".to_string(), (None, 100)),
+            ("config.values.value2".to_string(), (Some("value".to_string()), 0)),
+            (".".to_string(), (Some("default".to_string()),100)),
+        ]);
+
+        let mut parser: JSONChunkParser = create_parser(&path_map);
+
+        let expected: HashMap<String, Value> = HashMap::from([
+            ("metadata".to_string(), extract_json_value(&json_bytes, &["metadata",""])),
+            ("locale".to_string(), extract_json_value(&json_bytes, &["metadata","stats","details","locale"])),
+            ("config.key".to_string(), extract_json_value(&json_bytes, &["config","key"])),
+            ("value".to_string(), extract_json_value(&json_bytes, &["config","values","value2"])),
+            ("default".to_string(), extract_json_value(&json_bytes, &[""])),
+        ]);
+
+        let (all_names, successors) = get_expected_field_names(&path_map);
+        // Split at random boundaries between 50 and 300 bytes (seed = 42).
+        let chunks: Vec<Vec<u8>> = random_chunks(&json_bytes, 10, 50, 42, true, &all_names);
+        print_relevant_chunks(&all_names, &successors, &chunks);
+        
+        let total: usize = chunks.len();
+        for (i, chunk) in chunks.iter().enumerate() {
+            println!("Processing chunk {}/{} bytes {}", i+1, chunks.len(), chunk.len());
+            parser.process_chunk(chunk, i == total - 1);
+            if parser.is_all_found() {
+                break
+            }
+        }
+        let json: Value = parser.get_result_json();
+        print_jsons(&expected, &parser.matches_found, &json, false);
+        assert_eq!(parser.is_all_found(), true);
+        assert_eq!(parser.get_field("metadata.stats.details.locale").overflow, false);
+        assert_eq!(parser.get_field("config.key").overflow, false);
+        assert_eq!(parser.get_field("config.values.value2").overflow, false);
+        assert_eq!(json, serde_json::to_value(expected).unwrap());
+    }
+
+    #[test]
+    fn test_fields_overflow() {
+        let json_bytes = build_large_json(3, 1000, false);
+
+        // Multiple target paths to find simultaneously during streaming.
+        let path_map = HashMap::from([
+            ("field_1".to_string(), (Some("b".to_string()), 0)),
+            ("metadata.stats.details.locale".to_string(), (Some("locale".to_string()), 200)),
+            ("config.key".to_string(), (None, 100)),
+            ("config.values.value2".to_string(), (Some("value".to_string()), 0)),
+        ]);
+
+        let (all_names, successors) = get_expected_field_names(&path_map);
+        let chunks = random_chunks(&json_bytes, 50, 300, 42, true, &all_names);
+        let mut expected = build_expected(&path_map, &json_bytes);
+        // Split at random boundaries between 50 and 300 bytes (seed = 42).
+        print_relevant_chunks(&all_names, &successors, &chunks);
+        
+        let mut parser = create_parser(&path_map);
+        feed_chunks_to_parser(&mut parser, &all_names, &successors, &chunks);
+        let json: Value = parser.get_result_json();
+        for k in &parser.overflowed_fields {
+            let tracker = parser.get_field(k);
+            expected.remove(k);
+            if let Some(o) = &tracker.output_key {
+                expected.remove(o);
+            }
+        }
+        print_jsons(&expected, &parser.matches_found, &json, false);
+        assert_eq!(parser.is_all_found(), true);
+        assert_eq!(parser.get_field("field_1").overflow, false);
+        assert_eq!(parser.get_field("metadata.stats.details.locale").overflow, true);
+        assert_eq!(parser.get_field("config.key").overflow, true);
+        assert_eq!(parser.get_field("config.values.value2").overflow, false);
+        assert_eq!(json, serde_json::to_value(&expected).unwrap());
+    }
+
+    #[test]
+    fn test_mix_flat_nested_fields_in_random_chunks() {
+        let json_bytes = build_large_json(10, 50, false);
+
+        // Multiple target paths to find simultaneously during streaming.
+        let path_map = HashMap::from([
+            ("field_1".to_string(), (Some("b".to_string()), 0)),
+            ("metadata.stats.details.locale".to_string(), (Some("locale".to_string()), 100)),
+            ("config.key".to_string(), (None, 100)),
+            ("config.values.value2".to_string(), (Some("value".to_string()), 0)),
+            ("timestamp".to_string(), (None,10)),
+        ]);
+        test_happy_paths(&json_bytes, &path_map);
+    }
+
+    #[test]
+    fn test_multi_nested_obj_arrays_in_random_chunks() {
+        let json_bytes = build_large_json(2, 10, false);
+
+        // Multiple target paths to find simultaneously during streaming.
+        let path_map: HashMap<String, (Option<String>, usize)> = HashMap::from([
+            ("metadata.stats.details.regions".to_string(), (Some("regions".to_string()), 0)),
+            ("config.values".to_string(), (Some("values".to_string()), 0)),
+            ("metadata.name".to_string(), (None, 0)),
+        ]);
+        test_happy_paths(&json_bytes, &path_map);
+    }
+
+    #[test]
+    fn test_invalid_json_fields() {
+        let json_bytes = build_large_json(20, 2_000, false);
+
+        // Multiple target paths to find simultaneously during streaming.
+        let path_map = HashMap::from([
+            ("field_x".to_string(), (None, 0)),
+            ("metadata.foo.details.region".to_string(), (Some("region".to_string()), 512)),
+            ("foo.name".to_string(), (None, 256)),
+        ]);
+        //nothing expected, so empty map
+        let expected : HashMap<String, Value> = HashMap::new();
+        let all_names: Vec<&str> = vec![];
+        // Split at random boundaries between 50 and 300 bytes (seed = 42).
+        let chunks = random_chunks(&json_bytes, 50, 300, 42, false, &all_names);
+        let mut parser = create_parser(&path_map);
+        let total: usize = chunks.len();
+        for (i, chunk) in chunks.iter().enumerate() {
+            println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
+            parser.process_chunk(chunk, i == total - 1);
+            if parser.is_all_found() {
+                break
+            }
+        }
+        let json: Value = parser.get_result_json();
+        print_jsons(&expected, &parser.matches_found, &json, false);
+        assert_eq!(parser.is_all_found(), false);
+        assert_eq!(json, serde_json::to_value(expected).unwrap());
+    }
 
   #[test]
-  fn test_object_with_empty_fields() {
-    let json_bytes = build_small_json(3, 10);
+    fn test_mix_valid_and_invalid_fields() {
+        let json_bytes = build_large_json(10, 1000, false);
 
-    // Multiple target paths to find simultaneously during streaming.
-    let path_map = HashMap::from([
-        ("metadata.".to_string(), (Some("metadata".to_string()), 100)),
-        ("metadata.stats.details.locale".to_string(), (Some("locale".to_string()), 100)),
-        ("config.key".to_string(), (None, 100)),
-        ("config.values.value2".to_string(), (Some("value".to_string()), 0)),
-        ("timestamp".to_string(), (None,10)),
-        (".".to_string(), (Some("default".to_string()),100)),
-    ]);
+        // Multiple target paths to find simultaneously during streaming.
+        let path_map = HashMap::from([
+            ("field_x".to_string(), (Some("b".to_string()),1024)),
+            ("metadata.stats.details.locale".to_string(), (Some("locale".to_string()),100)),
+            ("config.stamp".to_string(), (None, 0)),
+            ("timestamp".to_string(), (None, 0)),
+        ]);
 
-    let expected: HashMap<String, Value> = HashMap::from([
-        ("metadata".to_string(), extract_json_value(&json_bytes, &["metadata",""])),
-        ("locale".to_string(), extract_json_value(&json_bytes, &["metadata","stats","details","locale"])),
-        ("config.key".to_string(), extract_json_value(&json_bytes, &["config","key"])),
-        ("value".to_string(), extract_json_value(&json_bytes, &["config","values","value2"])),
-        ("timestamp".to_string(), extract_json_value(&json_bytes, &["timestamp"])),
-        ("default".to_string(), extract_json_value(&json_bytes, &[""])),
-    ]);
+        let expected = build_expected(&path_map, &json_bytes);
+        let (all_names, successors) = get_expected_field_names(&path_map);
+        // Split at random boundaries between 50 and 300 bytes (seed = 42).
+        let chunks = random_chunks(&json_bytes, 50, 300, 42, true, &all_names);
+        print_relevant_chunks(&all_names, &successors, &chunks);
+        
+        let total: usize = chunks.len();
+        let mut parser = create_parser(&path_map);
+        for (i, chunk) in chunks.iter().enumerate() {
+            println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
+            parser.process_chunk(chunk, i == total - 1);
+            if parser.is_all_found() {
+                break
+            }
+        }
+        let json: Value = parser.get_result_json();
+        print_jsons(&expected, &parser.matches_found, &json, false);
+        assert_eq!(parser.is_all_found(), false);
+        assert_eq!(parser.get_field("metadata.stats.details.locale").overflow, true);
+        assert_ne!(json, serde_json::to_value(expected).unwrap());
+    }
 
-    let (all_names, successors) = get_expected_field_names(&path_map);
-    // Split at random boundaries between 50 and 300 bytes (seed = 42).
-    let chunks = random_chunks(json_bytes, 10, 50, 42, true, &all_names);
+    fn test_happy_paths(json_bytes: &Vec<u8>, path_map: &HashMap<String, (Option<String>, usize)>) {
+        let mut parser = create_parser(path_map);
+        let (all_names, successors) = get_expected_field_names(&path_map);
+        let chunks: Vec<Vec<u8>> = random_chunks(&json_bytes, 10, 50, 42, true, &all_names);
+        let expected = build_expected_with_pos(&path_map, &chunks);
+        let last_chunk_o = feed_chunks_to_parser(&mut parser, &all_names, &successors, &chunks);
+        let matches = parser.get_matches().clone();
+        let json: Value = parser.get_result_json();
+        print_jsons_with_chunk_info(&expected, &matches, &json, false);
+        assert_eq!(parser.is_all_found(), true);
+        assert_eq!(last_chunk_o.is_some(), true);
+        let actual_last_chunk = last_chunk_o.unwrap();
+        println!("Parser exited at chunk {} with {} remaining", actual_last_chunk, chunks.len()-actual_last_chunk);
+        let mut expected_last_chunk = 0;
+        for (key, (out_key, _)) in path_map {
+            let mut field = key;
+            if let Some(v) = out_key {
+                field = v;
+            }
+            let field_chunk = expected.get(field).unwrap().0;
+            assert_eq!(field_chunk <= actual_last_chunk, true);
+            if expected_last_chunk < field_chunk {
+                expected_last_chunk = field_chunk;
+            }
+        }
+        assert_eq!(expected_last_chunk, actual_last_chunk);
+    }
+}
+
+// -- helper functions
+fn create_parser(path_map: &HashMap<String, (Option<String>, usize)>) -> JSONChunkParser {
+    let mut parser = JSONChunkParser::default();
+    for (path, value) in path_map {
+        parser.add_search_field(path.to_owned(), value.0.to_owned(), value.1);
+    }
+    parser
+}
+
+fn feed_chunks_to_parser(parser: &mut JSONChunkParser, all_names: &Vec<&str>, successors: &HashMap<&str, &str>, chunks: &Vec<Vec<u8>>) -> Option<usize> {
     print_relevant_chunks(&all_names, &successors, &chunks);
-    
     let total: usize = chunks.len();
-    let mut parser = create_parser(path_map);
+    let mut matched = 0;
+    let mut overflown = 0;
     for (i, chunk) in chunks.iter().enumerate() {
         println!("Processing chunk {}/{} bytes {}", i+1, chunks.len(), chunk.len());
         parser.process_chunk(chunk, i == total - 1);
+        if parser.done_fields.len() > matched {
+            println!("Matched so far: {:?}", parser.done_fields);
+            matched = parser.done_fields.len();
+        }
+        if parser.overflowed_fields.len() > overflown {
+            println!("Overflow so far: {:?}", parser.overflowed_fields);
+            overflown = parser.overflowed_fields.len();
+        }
         if parser.is_all_found() {
-            break
+            return Some(i+1)
         }
     }
-    println!("expected ({}):", expected.len());
-    print_mapjson_summary(&expected, false);
-    println!("parser.matches_found ({}):", parser.matches_found.len());
-    print_mapjson_summary(&parser.matches_found, false);
-    assert_eq!(parser.is_all_found(), true);
-    assert_eq!(parser.get_field("metadata.stats.details.locale").overflow, false);
-    assert_eq!(parser.get_field("config.key").overflow, false);
-    assert_eq!(parser.get_field("config.values.value2").overflow, false);
-    assert_eq!(parser.get_field("timestamp").overflow, false);
-    let json = parser.get_result_json();
-    println!("Result JSON:");
-    print_json_summary(&json, false);
-    assert_eq!(json, serde_json::to_value(expected).unwrap());
-  
-  }
+    return None
+}
 
-  #[test]
-  fn test_fields_overflow() {
-    let json_bytes = build_large_json(3, 1000);
-
-    // Multiple target paths to find simultaneously during streaming.
-    let path_map = HashMap::from([
-        ("field_1".to_string(), (Some("b".to_string()), 0)),
-        ("metadata.stats.details.locale".to_string(), (Some("locale".to_string()), 200)),
-        ("config.key".to_string(), (None, 100)),
-        ("config.values.value2".to_string(), (Some("value".to_string()), 0)),
-        ("timestamp".to_string(), (None,10)),
-    ]);
-
-    let expected = build_expected(&path_map, &json_bytes);
-    let (all_names, successors) = get_expected_field_names(&path_map);
-    // Split at random boundaries between 50 and 300 bytes (seed = 42).
-    let chunks = random_chunks(json_bytes, 50, 300, 42, true, &all_names);
-    print_relevant_chunks(&all_names, &successors, &chunks);
-    
-    let total: usize = chunks.len();
-    let mut parser = create_parser(path_map);
-    for (i, chunk) in chunks.iter().enumerate() {
-        println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
-        parser.process_chunk(chunk, i == total - 1);
-        if parser.is_all_found() {
-            break
+fn build_expected_with_pos(path_map: &HashMap<String, (Option<String>, usize)>, chunks: &Vec<Vec<u8>>) -> HashMap<String, (usize,Value)> {
+    let mut expected : HashMap<String, (usize,Value)> = HashMap::new();
+    // Derive expected values by navigating each path in the full JSON.
+    for (json_path, output) in path_map {
+        let mut rem : Vec<u8> = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let fields_vec: Vec<&str> = json_path.split('.').collect();
+            let mut data = rem.to_vec();
+            data.extend_from_slice(chunk.as_slice());
+            let json_value = extract_json_value(&data, &fields_vec);
+            if !json_value.is_null() {
+                expected.insert(output.clone().0.unwrap_or(json_path.to_string()), (i+1, json_value));
+                break
+            }
+            rem = data.to_vec();
         }
     }
-    println!("expected ({}):", expected.len());
-    print_mapjson_summary(&expected, false);
-    println!("parser.matches_found ({}):", parser.matches_found.len());
-    print_mapjson_summary(&parser.matches_found, false);
-    assert_eq!(parser.is_all_found(), false);
-    assert_eq!(parser.get_field("field_1").overflow, false);
-    assert_eq!(parser.get_field("metadata.stats.details.locale").overflow, true);
-    assert_eq!(parser.get_field("config.key").overflow, true);
-    assert_eq!(parser.get_field("config.values.value2").overflow, false);
-    assert_eq!(parser.get_field("timestamp").overflow, false);
-    let json = parser.get_result_json();
-    println!("Result JSON:");
-    print_json_summary(&json, false);
-    assert_ne!(json, serde_json::to_value(expected).unwrap());
-  }
+    expected
+}
 
-  #[test]
-  fn test_mix_flat_nested_fields_in_random_chunks() {
-    let json_bytes = build_large_json(10, 50);
-
-    // Multiple target paths to find simultaneously during streaming.
-    let path_map = HashMap::from([
-        ("field_1".to_string(), (Some("b".to_string()), 0)),
-        ("metadata.stats.details.locale".to_string(), (Some("locale".to_string()), 100)),
-        ("config.key".to_string(), (None, 100)),
-        ("config.values.value2".to_string(), (Some("value".to_string()), 0)),
-        ("timestamp".to_string(), (None,10)),
-    ]);
-
-    let expected = build_expected(&path_map, &json_bytes);
-    let (all_names, successors) = get_expected_field_names(&path_map);
-    // Split at random boundaries between 50 and 300 bytes (seed = 42).
-    let chunks = random_chunks(json_bytes, 50, 300, 42, true, &all_names);
-    print_relevant_chunks(&all_names, &successors, &chunks);
-    
-    let total: usize = chunks.len();
-    let mut parser = create_parser(path_map);
-    for (i, chunk) in chunks.iter().enumerate() {
-        println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
-        parser.process_chunk(chunk, i == total - 1);
-        if parser.is_all_found() {
-            break
+fn build_expected(path_map: &HashMap<String, (Option<String>, usize)>, json_bytes: &Vec<u8>) -> HashMap<String, Value> {
+    let mut expected : HashMap<String, Value> = HashMap::new();
+    // Derive expected values by navigating each path in the full JSON.
+    for (json_path, output) in path_map {
+        let fields_vec: Vec<&str> = json_path.split('.').collect();
+        let json_value = extract_json_value(&json_bytes, &fields_vec);
+        if !json_value.is_null() {
+            expected.insert(output.clone().0.unwrap_or(json_path.to_string()), json_value);
         }
     }
-    println!("expected ({}):", expected.len());
-    print_mapjson_summary(&expected, false);
-    println!("parser.matches_found ({}):", parser.matches_found.len());
-    print_mapjson_summary(&parser.matches_found, false);
-    assert_eq!(parser.is_all_found(), true);
-    let json = parser.get_result_json();
-    println!("Result JSON:");
-    print_json_summary(&json, false);
-    assert_eq!(json, serde_json::to_value(expected).unwrap());
-  }
+    expected
+}
 
-  #[test]
-  fn test_multi_nested_obj_arrays_in_random_chunks() {
-    let json_bytes = build_large_json(2, 10);
-
-    // Multiple target paths to find simultaneously during streaming.
-    let path_map: HashMap<String, (Option<String>, usize)> = HashMap::from([
-        ("metadata.stats.details.regions".to_string(), (Some("regions".to_string()), 0)),
-        ("config.values".to_string(), (Some("values".to_string()), 0)),
-        ("metadata.name".to_string(), (None, 0)),
-    ]);
-
-    let expected = build_expected(&path_map, &json_bytes);
-    let (all_names, successors) = get_expected_field_names(&path_map);
-    // Split at random boundaries between 50 and 300 bytes (seed = 42).
-    let chunks = random_chunks(json_bytes, 50, 300, 42, true, &all_names);
-    print_relevant_chunks(&all_names, &successors, &chunks);
-    
-    let total: usize = chunks.len();
-    let mut parser = create_parser(path_map);
-    for (i, chunk) in chunks.iter().enumerate() {
-        println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
-        parser.process_chunk(chunk, i == total - 1);
-        if parser.is_all_found() {
-            break
+fn get_expected_field_names(path_map: &HashMap<String, (Option<String>, usize)>) -> (Vec<&str>, HashMap<&str, &str>) {
+    let fields: Vec<Vec<&str>> = path_map.keys().map(|k| k.split('.').collect()).collect();
+    let all_names: Vec<&str> = fields.iter().flat_map(|p| p.iter().copied()).collect();
+    let mut successors: HashMap<&str, &str> = HashMap::new();
+    let successors_lock = SUCCESSORS.lock().unwrap();
+    for name in &all_names {
+        if let Some(&value) = successors_lock.get(name) {
+            successors.insert(name, value);
         }
     }
+    (all_names, successors)
+}
+
+fn print_jsons_with_chunk_info(expected: &HashMap<String, (usize,Value)>, matches_found: &HashMap<String, Value>, result: &Value, verbose: bool) {
     println!("expected ({}):", expected.len());
-    print_mapjson_summary(&expected, true);
-    println!("parser.matches_found ({}):", parser.matches_found.len());
-    print_mapjson_summary(&parser.matches_found, true);
-    assert_eq!(parser.is_all_found(), true);
-    let json = parser.get_result_json();
+    print_json_chunkinfo(&expected, verbose);
+    println!("parser.matches_found ({}):", matches_found.len());
+    print_mapjson_summary(matches_found, verbose);
     println!("Result JSON:");
-    print_json_summary(&json, true);
-    assert_eq!(json, serde_json::to_value(expected).unwrap());
-  }
+    print_json_summary(result, verbose);
+}
 
-  #[test]
-  fn test_invalid_json_fields() {
-    let json_bytes = build_large_json(20, 2_000);
-
-    // Multiple target paths to find simultaneously during streaming.
-    let path_map = HashMap::from([
-        ("field_x".to_string(), (None, 0)),
-        ("metadata.foo.details.region".to_string(), (Some("region".to_string()), 512)),
-        ("foo.name".to_string(), (None, 256)),
-    ]);
-    //nothing expected, so empty map
-    let expected : HashMap<String, Value> = HashMap::new();
-    let all_names: Vec<&str> = vec![];
-    // Split at random boundaries between 50 and 300 bytes (seed = 42).
-    let chunks = random_chunks(json_bytes, 50, 300, 42, false, &all_names);
-    let mut parser = create_parser(path_map);
-    let total: usize = chunks.len();
-    for (i, chunk) in chunks.iter().enumerate() {
-        println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
-        parser.process_chunk(chunk, i == total - 1);
-        if parser.is_all_found() {
-            break
-        }
-    }
+fn print_jsons(expected: &HashMap<String, Value>, matches_found: &HashMap<String, Value>, result: &Value, verbose: bool) {
     println!("expected ({}):", expected.len());
-    print_mapjson_summary(&expected, false);
-    println!("parser.matches_found ({}):", parser.matches_found.len());
-    print_mapjson_summary(&parser.matches_found, false);
-    assert_eq!(parser.is_all_found(), false);
-    let json = parser.get_result_json();
+    print_mapjson_summary(&expected, verbose);
+    println!("parser.matches_found ({}):", matches_found.len());
+    print_mapjson_summary(matches_found, verbose);
     println!("Result JSON:");
-    print_json_summary(&json, false);
-    assert_eq!(json, serde_json::to_value(expected).unwrap());
-  }
-
-  #[test]
-  fn test_mix_valid_and_invalid_fields() {
-    let json_bytes = build_large_json(10, 1000);
-
-    // Multiple target paths to find simultaneously during streaming.
-    let path_map = HashMap::from([
-        ("field_x".to_string(), (Some("b".to_string()),1024)),
-        ("metadata.stats.details.locale".to_string(), (Some("locale".to_string()),100)),
-        ("config.stamp".to_string(), (None, 0)),
-        ("timestamp".to_string(), (None, 0)),
-    ]);
-
-    let expected = build_expected(&path_map, &json_bytes);
-    let (all_names, successors) = get_expected_field_names(&path_map);
-    // Split at random boundaries between 50 and 300 bytes (seed = 42).
-    let chunks = random_chunks(json_bytes, 50, 300, 42, true, &all_names);
-    print_relevant_chunks(&all_names, &successors, &chunks);
-    
-    let total: usize = chunks.len();
-    let mut parser = create_parser(path_map);
-    for (i, chunk) in chunks.iter().enumerate() {
-        println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
-        parser.process_chunk(chunk, i == total - 1);
-        if parser.is_all_found() {
-            break
-        }
-    }
-    println!("expected ({}):", expected.len());
-    print_mapjson_summary(&expected, false);
-    println!("parser.matches_found ({}):", parser.matches_found.len());
-    print_mapjson_summary(&parser.matches_found, false);
-    assert_eq!(parser.is_all_found(), false);
-    assert_eq!(parser.get_field("metadata.stats.details.locale").overflow, true);
-    let json = parser.get_result_json();
-    println!("Result JSON:");
-    print_json_summary(&json, false);
-    assert_ne!(json, serde_json::to_value(expected).unwrap());
-  }
+    print_json_summary(result, verbose);
 }
 
 fn v(ch: char, value_len: usize) -> String { 
@@ -358,7 +425,7 @@ fn set_larger_json_successors() {
 ///
 /// `field_count` also controls how many elements the arrays contain.
 /// `value_len` sets the length of every string value.
-fn build_large_json(field_count: usize, value_len: usize) -> Vec<u8> {
+fn build_large_json(field_count: usize, value_len: usize, verbose: bool) -> Vec<u8> {
     // ── flat scalar fields: field_0 … field_{N-1} ───────────────────────────
     let flat_fields = build_flat_fields(field_count, value_len);
     // flat_fields always ends with ',' — the nested section follows
@@ -408,10 +475,12 @@ fn build_large_json(field_count: usize, value_len: usize) -> Vec<u8> {
         signature = str_array('N', field_count, value_len),
         timestamp = 123456,
     );
-    println!("=== JSON structure ===");
     let json_bytes = json.into_bytes();
-    print_json_structure(&json_bytes);
-    println!("=== end structure ===\n");
+    if verbose {
+        println!("=== JSON structure ===");
+        print_json_structure(&json_bytes);
+        println!("=== end structure ===\n");
+    }
     json_bytes
 }
 
@@ -485,7 +554,7 @@ fn build_small_json(field_count: usize, value_len: usize) -> Vec<u8> {
 }
 
 /// Split `bytes` at random positions (chunk size between `min` and `max` bytes).
-fn random_chunks(bytes: Vec<u8>, min: usize, max: usize, seed: u64, split_random_keys: bool, keys: &Vec<&str>) -> Vec<Vec<u8>> {
+fn random_chunks(bytes: &Vec<u8>, min: usize, max: usize, seed: u64, split_random_keys: bool, keys: &Vec<&str>) -> Vec<Vec<u8>> {
     let mut chunks = Vec::new();
     let mut pos = 0;
     let mut rng = seed;
@@ -531,32 +600,6 @@ fn bytes_to_value(b: &Vec<u8>) -> Value {
     return serde_json::from_slice::<Value>(&b).unwrap_or_default();
 }
 
-fn build_expected(path_map: &HashMap<String, (Option<String>, usize)>, json_bytes: &Vec<u8>) -> HashMap<String, Value> {
-    let mut expected : HashMap<String, Value> = HashMap::new();
-    // Derive expected values by navigating each path in the full JSON.
-    for (json_path, output) in path_map {
-        let fields_vec: Vec<&str> = json_path.split('.').collect();
-        let json_value = extract_json_value(&json_bytes, &fields_vec);
-        if !json_value.is_null() {
-            expected.insert(output.clone().0.unwrap_or(json_path.to_string()), json_value);
-        }
-    }
-    expected
-}
-
-fn get_expected_field_names(path_map: &HashMap<String, (Option<String>, usize)>) -> (Vec<&str>, HashMap<&str, &str>) {
-    let fields: Vec<Vec<&str>> = path_map.keys().map(|k| k.split('.').collect()).collect();
-    let all_names: Vec<&str> = fields.iter().flat_map(|p| p.iter().copied()).collect();
-    let mut successors: HashMap<&str, &str> = HashMap::new();
-    let successors_lock = SUCCESSORS.lock().unwrap();
-    for name in &all_names {
-        if let Some(&value) = successors_lock.get(name) {
-            successors.insert(name, value);
-        }
-    }
-    (all_names, successors)
-}
-
 /// Walk `bytes` as JSON and return the value found at `path` as a String.
 ///
 /// `path` is a sequence of object keys describing a nested location, e.g.
@@ -567,10 +610,10 @@ fn get_expected_field_names(path_map: &HashMap<String, (Option<String>, usize)>)
 /// - Object or array at the terminal key: the full raw JSON substring is returned.
 /// - Arrays that do *not* appear as the terminal path component are skipped.
 fn extract_json_value(bytes: &[u8], path: &[&str]) -> Value {
+    let mut parser = JSONEventGenerator::new();
     if path.is_empty() {
         return json!(null);
     }
-    let mut parser = JSONEventGenerator::new();
     let mut cursor = 0usize;
     let mut pending_key: Option<String> = None;
     // How many path components have been successfully entered.
@@ -905,10 +948,10 @@ fn print_relevant_chunks(all_names: &Vec<&str>, successors: &HashMap<&str, &str>
     println!();
 }
 
-fn print_kv(k: &String, v: &Value, all: bool) {
+fn print_kv(k: &String, v: &Value, verbose: bool) {
     let value = serde_json::to_string(&v).unwrap();
     let len = value.len()-2;
-    if all || len < 10 {
+    if verbose || len < 10 {
         println!("  {k}: {value}");
         return;
     }
@@ -921,23 +964,36 @@ fn print_kv(k: &String, v: &Value, all: bool) {
     println!("  {k}: {start}...{len}...{end}");
 }
 
-fn print_mapjson_summary(json : &HashMap<String, Value>, all: bool) {
+fn print_json_chunkinfo(json : &HashMap<String, (usize,Value)>, verbose: bool) {
     let empty: String = "\"\"".to_string();
     println!("{{");
     for (mut k, v) in json.iter() {
         if k == "" {
             k = &empty;
         }
-        print_kv(k, v, all);
+        println!("In chunk# {}", &v.0);
+        print_kv(k, &v.1, verbose);
     }
     println!("}}");
 }
 
-fn print_json_summary(json : &Value, all: bool) {
+fn print_mapjson_summary(json : &HashMap<String, Value>, verbose: bool) {
+    let empty: String = "\"\"".to_string();
+    println!("{{");
+    for (mut k, v) in json.iter() {
+        if k == "" {
+            k = &empty;
+        }
+        print_kv(k, v, verbose);
+    }
+    println!("}}");
+}
+
+fn print_json_summary(json : &Value, verbose: bool) {
     println!("{{");
     if let Value::Object(map) = json {
         for (key, value) in map {
-            print_kv(key, &value, all);
+            print_kv(key, &value, verbose);
         }
     } else {
         println!("not an object: {}", json);

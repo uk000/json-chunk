@@ -6,10 +6,47 @@ use json_chunk::chunk_parser::JSONChunkParser;
 
 static SUCCESSORS: LazyLock<Mutex<HashMap<&'static str, &'static str>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+pub const MCP_METHOD_JSON_PATH: &str = r"method";
+pub const MCP_TOOL_JSON_PATH: &str = r"params.name";
+
 #[cfg(test)]
 mod tests {
 
 use super::*;
+
+  #[test]
+    fn test_detect_json_end_with_no_end_of_stream() {
+        let json_bytes = build_invalid_json(3, 10);
+
+        // Multiple target paths to find simultaneously during streaming.
+        let path_map = HashMap::from([
+            ("config.key".to_string(), (None, 100)),
+            ("config.values.xxx".to_string(), (Some("value".to_string()), 0)),
+        ]);
+
+        let expected = build_expected(&path_map, &json_bytes);
+        let (all_names, successors) = get_expected_field_names(&path_map);
+        // Split at random boundaries between 50 and 300 bytes (seed = 42).
+        let chunks = random_chunks(&json_bytes, 50, 300, 42, true, &all_names);
+        print_relevant_chunks(&all_names, &successors, &chunks);
+        
+        let total: usize = chunks.len();
+        let mut parser = create_parser(&path_map);
+        for (i, chunk) in chunks.iter().enumerate() {
+            println!("Processing chunk {}/{} bytes {}", i+1, total, chunk.len());
+            parser.process_chunk(chunk, false);
+            if parser.is_all_found() {
+                break
+            }
+        }
+        println!("json_depth = {}", parser.json_depth);
+        println!("end_of_json = {}", parser.end_of_json);
+        println!("short_circuit = {}", parser.short_circuit);
+        println!("end_of_stream = {}", parser.end_of_stream);
+        let json: Value = parser.get_result_json();
+        print_jsons(&expected, &parser.matches_found, &json, false);
+        assert_eq!(parser.is_all_found(), false);
+    }
 
   #[test]
     fn test_short_circuit_early_finish() {
@@ -551,6 +588,13 @@ fn build_small_json(field_count: usize, value_len: usize) -> Vec<u8> {
     print_json_structure(&json_bytes);
     println!("=== end structure ===\n");
     json_bytes
+}
+
+fn build_invalid_json(field_count: usize, value_len: usize) -> Vec<u8> {
+    let json: &mut Vec<u8> = &mut build_small_json(field_count, value_len);
+    json.append(&mut br#"-------"#.to_vec());
+    json.append(&mut br#"+++++++"#.to_vec());
+    json.to_vec()
 }
 
 /// Split `bytes` at random positions (chunk size between `min` and `max` bytes).

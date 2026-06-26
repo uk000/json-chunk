@@ -36,6 +36,10 @@ pub struct JSONChunkParser {
     pub matches_found: HashMap<String, Value>,
     pub done_fields: HashSet<String>,
     pub overflowed_fields: HashSet<String>,
+    pub json_depth: usize,
+    pub end_of_json: bool,
+    pub end_of_stream: bool,
+    pub short_circuit: bool,
 }
 
 impl JSONChunkParser {
@@ -74,7 +78,6 @@ impl JSONChunkParser {
         self.scratch_buffer.extend_from_slice(&chunk);
 
         let mut cursor = 0;
-        let mut short_circuit = false;
         loop {
             let slice_to_parse = &self.scratch_buffer[cursor..];
             let JSONEventWrapper {
@@ -95,7 +98,7 @@ impl JSONChunkParser {
                     break;
                 }
                 Some(Err(_)) => break,
-                Some(Ok(ev)) => ev,
+                Some(Ok(event)) => event,
             };
 
             let obj_key: Option<String> = if let JSONEvent::ObjectKey(k) = &ev {
@@ -117,6 +120,10 @@ impl JSONChunkParser {
 
             if is_eof {
                 break;
+            } else if is_start_object || is_start_array {
+                self.json_depth+=1;
+            } else if is_end_object || is_end_array {
+                self.json_depth-=1;
             }
 
             for (_, tracker) in &mut self.tracked_fields {
@@ -140,9 +147,7 @@ impl JSONChunkParser {
 
                     if !tracker.is_collecting() {
                         tracker.finish();
-                        if !tracker.overflow {
-                            self.done_fields.insert(tracker.json_path.to_owned());
-                        }
+                        Self::end_tracker(&mut self.matches_found, &mut self.done_fields, &mut self.overflowed_fields, tracker);
                     }
                     continue;
                 }
@@ -174,27 +179,25 @@ impl JSONChunkParser {
                     //check with tracker again if interested in collecting now
                     if tracker.will_collect() {
                         tracker.collect(v.as_bytes(), true);
-                        if tracker.overflow {
-                            self.overflowed_fields.insert(tracker.json_path.to_owned());
-                            tracker.reset(true);
-                        } else {
-                            self.done_fields.insert(tracker.json_path.to_owned());
-                        }
                         tracker.finish();
+                        Self::end_tracker(&mut self.matches_found, &mut self.done_fields, &mut self.overflowed_fields, tracker);
                     }
                 }
             }
 
             // Short-circuit the outer parse loop only when ALL trackers are done.
             if self.is_all_done() {
-                short_circuit = true;
+                self.short_circuit = true;
                 break;
             }
         }
 
         self.scratch_buffer.drain(0..cursor);
-
-        if end_of_stream || short_circuit {
+        if self.json_depth == 0 {
+            self.end_of_json = true
+        }
+        self.end_of_stream = end_of_stream;
+        if end_of_stream || self.short_circuit || self.end_of_json {
             self.end_tracking();
             //if need to do something after all matches found, this is the place
         }
@@ -202,27 +205,24 @@ impl JSONChunkParser {
 
     fn end_tracking(&mut self) {
         for (_, tracker) in &mut self.tracked_fields {
-            if !tracker.done && !tracker.overflow && tracker.has_data() {
-                tracker.finish();
-                self.done_fields.insert(tracker.json_path.to_owned());
-            }
-            if tracker.has_data() {
-                let buf = &tracker.collect_buffer;
-                let json_value = match buf.first() {
-                    // Object or array — parse as JSON directly.
-                    Some(b'{') | Some(b'[') => serde_json::from_slice::<Value>(buf).ok(),
-                    // Anything else: try JSON first (handles numbers, booleans, null),
-                    // then fall back to treating the raw bytes as a plain string.
-                    _ => serde_json::from_slice::<Value>(buf).ok().or_else(|| {
-                        std::str::from_utf8(buf)
-                            .ok()
-                            .map(|s| Value::String(s.to_owned()))
-                    }),
-                };
-                if let Some(v) = json_value {
-                    self.matches_found.insert(tracker.json_path.clone(), v);
+            tracker.finish();
+            Self::end_tracker(&mut self.matches_found, &mut self.done_fields, &mut self.overflowed_fields, tracker);
+        }
+    }
+
+    fn end_tracker(matches_found: &mut HashMap<String, Value>, done_fields: &mut HashSet<String>, overflowed_fields: &mut HashSet<String>, tracker: &JSONPathTracker) {
+        if !tracker.overflow {
+            if let Some(v) = tracker.get_value() {
+                if let Some(output_key) = &tracker.output_key {
+                    matches_found.insert(output_key.clone(), v);
+                    matches_found.remove(&tracker.json_path);
+                } else {
+                    matches_found.insert(tracker.json_path.clone(), v);
                 }
+                done_fields.insert(tracker.json_path.to_owned());
             }
+        } else {
+            overflowed_fields.insert(tracker.json_path.to_owned());
         }
     }
 
@@ -253,16 +253,7 @@ impl JSONChunkParser {
     }
 
     pub fn get_result_json(&mut self) -> Value {
-        for (_, tracker) in &self.tracked_fields {
-            if let Some(output_key) = &tracker.output_key {
-                if let Some(value) = self.matches_found.get(&tracker.json_path) {
-                    self.matches_found.insert(output_key.clone(), value.to_owned());
-                    self.matches_found.remove(&tracker.json_path);
-                }
-            }
-        }
-        let json = serde_json::to_value(&mut self.matches_found).unwrap();
-        json
+        serde_json::to_value(&mut self.matches_found).unwrap()
     }
 }
 
@@ -276,6 +267,10 @@ impl Default for JSONChunkParser {
             matches_found: HashMap::new(),
             overflowed_fields: HashSet::new(),
             done_fields: HashSet::new(),
+            json_depth: 0,
+            short_circuit: false,
+            end_of_json: false,
+            end_of_stream: false,
         }
     }
 }
@@ -291,6 +286,10 @@ impl Clone for JSONChunkParser {
             matches_found: self.matches_found.clone(),
             overflowed_fields: self.overflowed_fields.clone(),
             done_fields: self.done_fields.clone(),
+            json_depth: 0,
+            short_circuit: false,
+            end_of_json: false,
+            end_of_stream: false,
         }
     }
 }
@@ -444,15 +443,34 @@ impl JSONPathTracker {
     }
 
     fn finish(&mut self) {
-        self.done = true;
+        if !self.done && !self.overflow && self.has_data() {
+            self.done = true;
+        } else if self.overflow {
+            self.reset(true);
+        }
     }
 
     fn has_data(&self) -> bool {
         return self.collect_buffer.len() > 0;
     }
 
-    pub fn get_value(&self) -> String {
-        return String::from_utf8_lossy(&self.collect_buffer).to_string();
+    pub fn get_value(&self) -> Option<Value> {
+        let buf = &self.collect_buffer;
+        if buf.len() == 0 {
+            return None
+        }
+        let json_value = match buf.first() {
+            // Object or array — parse as JSON directly.
+            Some(b'{') | Some(b'[') => serde_json::from_slice::<Value>(buf).ok(),
+            // Anything else: try JSON first (handles numbers, booleans, null),
+            // then fall back to treating the raw bytes as a plain string.
+            _ => serde_json::from_slice::<Value>(buf).ok().or_else(|| {
+                std::str::from_utf8(buf)
+                    .ok()
+                    .map(|s| Value::String(s.to_owned()))
+            }),
+        };
+        return json_value
     }
 
     fn reset(&mut self, overflow: bool) {

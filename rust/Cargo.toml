@@ -1,0 +1,16 @@
+[package]
+name = "json-chunk"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "json_chunk"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1.0.150"
+serde = "1.0.150"
+
+[[test]]
+name = "chunk_parser_tests"
+path = "tests/chunk_parser_tests.rs"

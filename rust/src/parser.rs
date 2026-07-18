@@ -54,7 +54,7 @@ impl JSONEventGenerator {
     /// Reads a new event from the data in `input_buffer`.
     ///
     /// `is_ending` must be set to true if all the JSON data have been already consumed or are in `input_buffer`.
-    pub fn parse_next<'a>(
+    pub fn next_event<'a>(
         &mut self,
         input_buffer: &'a [u8],
         is_ending: bool,
@@ -118,15 +118,6 @@ impl JSONEventGenerator {
                 None
             },
         }
-    }
-
-    #[deprecated(note = "Use parse_next() instead")]
-    pub fn read_next_event<'a>(
-        &mut self,
-        input_buffer: &'a [u8],
-        is_ending: bool,
-    ) -> JSONEventWrapper<'a> {
-        self.parse_next(input_buffer, is_ending)
     }
 
     fn apply_new_token<'a>(

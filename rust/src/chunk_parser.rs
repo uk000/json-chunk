@@ -1,11 +1,93 @@
-use crate::parser::{JSONEvent, JSONEventGenerator, JSONEventWrapper};
+use crate::parser::{JSONEvent, JSONEventGenerator};
+use crate::yaml_parser::{YAMLEvent, YAMLEventGenerator};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::fmt;
 use std::collections::{HashMap, HashSet};
 
+// ─── Normalized event ─────────────────────────────────────────────────────────
+//
+// Both the JSON and YAML parsers share the same structural vocabulary (String,
+// Number, Boolean, Null, StartObject/EndObject, StartArray/EndArray, ObjectKey,
+// Eof).  We fold both into `ChunkEvent` so `process_chunk` can stay format-
+// agnostic.  YAML-only lifecycle events (StreamStart/End, DocumentStart/End)
+// map to `Ignored`.
+
+#[derive(Debug)]
+enum ChunkEvent<'a> {
+    ObjectKey(Cow<'a, str>),
+    String(Cow<'a, str>),
+    Number(Cow<'a, str>),
+    Boolean(bool),
+    Null,
+    StartObject,
+    EndObject,
+    StartArray,
+    EndArray,
+    Eof,
+    /// YAML stream/document lifecycle events – not relevant to tracker logic.
+    Ignored,
+}
+
+fn from_json_event(ev: JSONEvent<'_>) -> ChunkEvent<'_> {
+    match ev {
+        JSONEvent::String(s)    => ChunkEvent::String(s),
+        JSONEvent::Number(n)    => ChunkEvent::Number(n),
+        JSONEvent::Boolean(b)   => ChunkEvent::Boolean(b),
+        JSONEvent::Null         => ChunkEvent::Null,
+        JSONEvent::StartObject  => ChunkEvent::StartObject,
+        JSONEvent::EndObject    => ChunkEvent::EndObject,
+        JSONEvent::StartArray   => ChunkEvent::StartArray,
+        JSONEvent::EndArray     => ChunkEvent::EndArray,
+        JSONEvent::ObjectKey(k) => ChunkEvent::ObjectKey(k),
+        JSONEvent::Eof          => ChunkEvent::Eof,
+    }
+}
+
+fn from_yaml_event(ev: YAMLEvent<'_>) -> ChunkEvent<'_> {
+    match ev {
+        YAMLEvent::String(s)    => ChunkEvent::String(s),
+        YAMLEvent::Number(n)    => ChunkEvent::Number(n),
+        YAMLEvent::Boolean(b)   => ChunkEvent::Boolean(b),
+        YAMLEvent::Null         => ChunkEvent::Null,
+        YAMLEvent::StartObject  => ChunkEvent::StartObject,
+        YAMLEvent::EndObject    => ChunkEvent::EndObject,
+        YAMLEvent::StartArray   => ChunkEvent::StartArray,
+        YAMLEvent::EndArray     => ChunkEvent::EndArray,
+        YAMLEvent::ObjectKey(k) => ChunkEvent::ObjectKey(k),
+        YAMLEvent::Eof          => ChunkEvent::Eof,
+        // YAML-only lifecycle events; callers handle via `Ignored`.
+        YAMLEvent::StreamStart
+        | YAMLEvent::StreamEnd
+        | YAMLEvent::DocumentStart
+        | YAMLEvent::DocumentEnd => ChunkEvent::Ignored,
+    }
+}
+
+/// Call whichever parser is active and return `(consumed_bytes, event)`.
+///
+/// Takes disjoint field borrows so `process_chunk` can simultaneously borrow
+/// `self.scratch_buffer` and `self.tracked_fields`.
+fn dispatch_next_event<'a>(
+    json_parser: &mut Option<JSONEventGenerator>,
+    yaml_parser: &mut Option<YAMLEventGenerator>,
+    buf: &'a [u8],
+    is_ending: bool,
+) -> (usize, Option<Result<ChunkEvent<'a>, ()>>) {
+    if let Some(p) = json_parser.as_mut() {
+        let w = p.next_event(buf, is_ending);
+        (w.consumed_bytes, w.event.map(|r| r.map(from_json_event).map_err(|_| ())))
+    } else if let Some(p) = yaml_parser.as_mut() {
+        let w = p.next_event(buf, is_ending);
+        (w.consumed_bytes, w.event.map(|r| r.map(from_yaml_event).map_err(|_| ())))
+    } else {
+        panic!("ChunkParser: no parser initialised – call new_json_parser or new_yaml_parser first")
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct JSONPathTracker {
-    pub json_path: String,
+pub struct PathTracker {
+    pub path: String,
     pub path_vector: Vec<String>,
     pub output_key: Option<String>,
     pub max_value_length: usize,
@@ -25,30 +107,67 @@ pub struct JSONPathTracker {
     pub overflow: bool,
 }
 
-pub struct JSONChunkParser {
+pub struct ChunkParser {
     pub scratch_buffer: Vec<u8>,
-    pub json_parser: JSONEventGenerator,
+    pub json_parser: Option<JSONEventGenerator>,
+    pub yaml_parser: Option<YAMLEventGenerator>,
     /// When true, halt after the first match found across all paths.
     pub stop_at_first_match: bool,
     /// One tracker per target path; all advance independently on the same stream.
-    pub tracked_fields: HashMap<String, JSONPathTracker>,
+    pub tracked_fields: HashMap<String, PathTracker>,
     /// Results collected, keyed by either matched path or overridden path.
     pub matches_found: HashMap<String, Value>,
     pub done_fields: HashSet<String>,
     pub overflowed_fields: HashSet<String>,
     pub json_depth: usize,
+    pub json_started: bool,
     pub end_of_json: bool,
     pub end_of_stream: bool,
     pub short_circuit: bool,
 }
 
-impl JSONChunkParser {
+impl ChunkParser {
+    fn new_parser(path_map: &HashMap<String, (Option<String>, usize)>) -> Self {
+        let mut parser = Self {
+            scratch_buffer: Vec::new(),
+            json_parser: None,
+            yaml_parser: None,
+            tracked_fields: HashMap::new(),
+            stop_at_first_match: true,
+            matches_found: HashMap::new(),
+            overflowed_fields: HashSet::new(),
+            done_fields: HashSet::new(),
+            json_depth: 0,
+            short_circuit: false,
+            end_of_json: false,
+            end_of_stream: false,
+            json_started: false,
+        };
+
+        for (path, value) in path_map {
+            parser.add_search_field(path.to_owned(), value.0.to_owned(), value.1);
+        }
+        parser
+    }
+
+    pub fn new_json_parser(path_map: &HashMap<String, (Option<String>, usize)>) -> Self {
+        let mut parser = ChunkParser::new_parser(path_map);
+        parser.json_parser = Some(JSONEventGenerator::new());
+        parser
+    }
+
+    pub fn new_yaml_parser(path_map: &HashMap<String, (Option<String>, usize)>) -> Self {
+        let mut parser = ChunkParser::new_parser(path_map);
+        parser.yaml_parser = Some(YAMLEventGenerator::new());
+        parser
+    }
+
     pub fn add_search_field(&mut self, json_path: String, output: Option<String>, max_size: usize) {
         let key = json_path.clone();
         let path = json_path.split('.').map(String::from).collect();
 
-        let tracker = JSONPathTracker {
-            json_path,
+        let tracker = PathTracker {
+            path: json_path,
             path_vector: path,
             output_key: output,
             max_value_length: max_size,
@@ -75,47 +194,57 @@ impl JSONChunkParser {
     }
 
     pub fn process_chunk(&mut self, chunk: &Vec<u8>, end_of_stream: bool) {
-        self.scratch_buffer.extend_from_slice(&chunk);
-
+        self.scratch_buffer.extend_from_slice(chunk);
         let mut cursor = 0;
         loop {
             let slice_to_parse = &self.scratch_buffer[cursor..];
-            let JSONEventWrapper {
-                consumed_bytes,
-                event,
-            } = self.json_parser.parse_next(slice_to_parse, end_of_stream);
+            let (consumed_bytes, event) = dispatch_next_event(
+                &mut self.json_parser,
+                &mut self.yaml_parser,
+                slice_to_parse,
+                end_of_stream,
+            );
             let event_start = cursor;
             cursor += consumed_bytes;
             let b: Vec<u8> = self.scratch_buffer[event_start..cursor].to_vec();
 
             let ev = match event {
                 None => {
-                    // No event produced, but bytes may have been consumed (e.g. a ':' or ',')
-                    // Append those bytes to any active collect_buffers so they are not lost
+                    // No event produced, but bytes may have been consumed (e.g. a ':' or ',').
+                    // Append those bytes to any active collect_buffers so they are not lost.
                     if consumed_bytes > 0 {
                         self.feed_trackers(&b);
                     }
                     break;
                 }
                 Some(Err(_)) => break,
-                Some(Ok(event)) => event,
+                Some(Ok(ChunkEvent::Ignored)) => {
+                    // YAML lifecycle events (StreamStart, DocumentStart, …) carry no
+                    // tracker-relevant data, but they may have consumed bytes that belong
+                    // to active collectors (e.g. an explicit `---`).
+                    if consumed_bytes > 0 {
+                        self.feed_trackers(&b);
+                    }
+                    continue;
+                }
+                Some(Ok(ev)) => ev,
             };
-
-            let obj_key: Option<String> = if let JSONEvent::ObjectKey(k) = &ev {
+            self.json_started = true;
+            let obj_key: Option<String> = if let ChunkEvent::ObjectKey(k) = &ev {
                 Some(k.to_string())
             } else {
                 None
             };
             let leaf_val: Option<String> = match &ev {
-                JSONEvent::String(v) | JSONEvent::Number(v) => Some(v.to_string()),
-                JSONEvent::Boolean(b) => Some(b.to_string()),
+                ChunkEvent::String(v) | ChunkEvent::Number(v) => Some(v.to_string()),
+                ChunkEvent::Boolean(b) => Some(b.to_string()),
                 _ => None,
             };
-            let is_start_object = matches!(&ev, JSONEvent::StartObject);
-            let is_end_object = matches!(&ev, JSONEvent::EndObject);
-            let is_start_array = matches!(&ev, JSONEvent::StartArray);
-            let is_end_array = matches!(&ev, JSONEvent::EndArray);
-            let is_eof = matches!(&ev, JSONEvent::Eof);
+            let is_start_object = matches!(&ev, ChunkEvent::StartObject);
+            let is_end_object   = matches!(&ev, ChunkEvent::EndObject);
+            let is_start_array  = matches!(&ev, ChunkEvent::StartArray);
+            let is_end_array    = matches!(&ev, ChunkEvent::EndArray);
+            let is_eof          = matches!(&ev, ChunkEvent::Eof);
             drop(ev); // release borrow of scratch_buffer
 
             if is_eof {
@@ -135,7 +264,7 @@ impl JSONChunkParser {
                 if tracker.is_collecting() {
                     tracker.collect(&b, false);
                     if tracker.overflow {
-                        self.overflowed_fields.insert(tracker.json_path.to_owned());
+                        self.overflowed_fields.insert(tracker.path.to_owned());
                         tracker.reset(true);
                     }
                     tracker.move_collect_pointers(
@@ -193,7 +322,7 @@ impl JSONChunkParser {
         }
 
         self.scratch_buffer.drain(0..cursor);
-        if self.json_depth == 0 {
+        if self.json_started && self.json_depth == 0 {
             self.end_of_json = true
         }
         self.end_of_stream = end_of_stream;
@@ -210,19 +339,19 @@ impl JSONChunkParser {
         }
     }
 
-    fn end_tracker(matches_found: &mut HashMap<String, Value>, done_fields: &mut HashSet<String>, overflowed_fields: &mut HashSet<String>, tracker: &JSONPathTracker) {
+    fn end_tracker(matches_found: &mut HashMap<String, Value>, done_fields: &mut HashSet<String>, overflowed_fields: &mut HashSet<String>, tracker: &PathTracker) {
         if !tracker.overflow {
             if let Some(v) = tracker.get_value() {
                 if let Some(output_key) = &tracker.output_key {
                     matches_found.insert(output_key.clone(), v);
-                    matches_found.remove(&tracker.json_path);
+                    matches_found.remove(&tracker.path);
                 } else {
-                    matches_found.insert(tracker.json_path.clone(), v);
+                    matches_found.insert(tracker.path.clone(), v);
                 }
-                done_fields.insert(tracker.json_path.to_owned());
+                done_fields.insert(tracker.path.to_owned());
             }
         } else {
-            overflowed_fields.insert(tracker.json_path.to_owned());
+            overflowed_fields.insert(tracker.path.to_owned());
         }
     }
 
@@ -230,7 +359,7 @@ impl JSONChunkParser {
         for (_, tracker) in &mut self.tracked_fields {
             tracker.collect(b, false);
             if tracker.overflow {
-                self.overflowed_fields.insert(tracker.json_path.to_owned());
+                self.overflowed_fields.insert(tracker.path.to_owned());
                 tracker.reset(true);
             }
         }
@@ -244,7 +373,7 @@ impl JSONChunkParser {
         self.tracked_fields.len() == self.done_fields.len() + self.overflowed_fields.len()
     }
 
-    pub fn get_field(&self, name: &str) -> &JSONPathTracker {
+    pub fn get_field(&self, name: &str) -> &PathTracker {
         self.tracked_fields.get(name).expect("field not found")
     }
 
@@ -257,11 +386,12 @@ impl JSONChunkParser {
     }
 }
 
-impl Default for JSONChunkParser {
+impl Default for ChunkParser {
     fn default() -> Self {
         Self {
             scratch_buffer: Vec::new(),
-            json_parser: JSONEventGenerator::new(),
+            json_parser: None,
+            yaml_parser: None,
             tracked_fields: HashMap::new(),
             stop_at_first_match: true,
             matches_found: HashMap::new(),
@@ -271,16 +401,18 @@ impl Default for JSONChunkParser {
             short_circuit: false,
             end_of_json: false,
             end_of_stream: false,
+            json_started: false,
         }
     }
 }
 
-impl Clone for JSONChunkParser {
+impl Clone for ChunkParser {
     fn clone(&self) -> Self {
         // LowLevelJsonParser is stateful and not Clone; reset it on clone.
         Self {
             scratch_buffer: self.scratch_buffer.clone(),
-            json_parser: JSONEventGenerator::new(),
+            json_parser: None,
+            yaml_parser: None,
             tracked_fields: self.tracked_fields.clone(),
             stop_at_first_match: self.stop_at_first_match,
             matches_found: self.matches_found.clone(),
@@ -290,11 +422,12 @@ impl Clone for JSONChunkParser {
             short_circuit: false,
             end_of_json: false,
             end_of_stream: false,
+            json_started: false,
         }
     }
 }
 
-impl fmt::Debug for JSONChunkParser {
+impl fmt::Debug for ChunkParser {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JsonStreamParser")
             .field("scratch_buffer_len", &self.scratch_buffer.len())
@@ -305,7 +438,7 @@ impl fmt::Debug for JSONChunkParser {
     }
 }
 
-impl JSONPathTracker {
+impl PathTracker {
     fn is_collecting(&self) -> bool {
         return self.collecting_depth > 0;
     }
@@ -484,3 +617,4 @@ impl JSONPathTracker {
         self.overflow = overflow;
     }
 }
+

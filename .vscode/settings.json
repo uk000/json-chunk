@@ -1,0 +1,6 @@
+{
+  "diffEditor.codeLens": true,
+  "rust-analyzer.linkedProjects": [
+    "${workspaceFolder}/rust/Cargo.toml"
+  ]
+}

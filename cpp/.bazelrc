@@ -1,0 +1,3 @@
+# Disable the Bazel Central Registry (bcr.bazel.build).
+# This library has no external bazel_dep() entries, so no registry is needed.
+# This also allows builds on networks that block bcr.bazel.build (e.g. Cisco VPN).

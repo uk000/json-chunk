@@ -2,7 +2,11 @@
         rust-build rust-test rust-clean \
         go-build go-test go-clean \
         cpp-build cpp-test cpp-clean \
+        lua-test \
         test build clean
+
+LUA_DIR    := lua
+LUA        ?= luajit
 
 CPP_DIR    := cpp
 CPP_BUILD  := $(CPP_DIR)/build
@@ -27,9 +31,12 @@ help:
 	@echo "  make cpp-test      - Build and run C++ tests"
 	@echo "  make cpp-clean     - Clean C++ build artifacts"
 	@echo ""
+	@echo "Lua targets:"
+	@echo "  make lua-test      - Run Lua parser and chunk-parser tests"
+	@echo ""
 	@echo "Combined targets:"
 	@echo "  make build         - Build Rust, Go, and C++"
-	@echo "  make test          - Test Rust, Go, and C++"
+	@echo "  make test          - Test Rust, Go, C++, and Lua"
 	@echo "  make clean         - Clean Rust, Go, and C++"
 	@echo "  make help          - Display this help message"
 
@@ -52,6 +59,13 @@ go-test:
 
 go-clean:
 	cd go && go clean
+
+# ─── Lua ─────────────────────────────────────────────────────────────────────
+lua-test:
+	@echo "Running Lua parser tests..."
+	cd $(LUA_DIR) && $(LUA) test_parser.lua
+	@echo "Running Lua chunk-parser tests..."
+	cd $(LUA_DIR) && $(LUA) test_chunk_parser.lua
 
 # ─── C++ ─────────────────────────────────────────────────────────────────────
 # Detect whether cmake is available; if not, fall back to a direct clang++ build.
@@ -87,6 +101,6 @@ cpp-clean:
 # ─── Combined ────────────────────────────────────────────────────────────────
 build: rust-build go-build cpp-build
 
-test: rust-test go-test cpp-test
+test: rust-test go-test cpp-test lua-test
 
 clean: rust-clean go-clean cpp-clean

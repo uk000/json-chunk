@@ -1,0 +1,40 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+
+# ─── nlohmann/json (bundled single-header) ───────────────────────────────────
+# Exposes <nlohmann/json.hpp> via the bundled vendor copy so consumers don't
+# need an external repository declaration.
+cc_library(
+    name = "nlohmann_json",
+    hdrs = ["third_party/nlohmann/json.hpp"],
+    includes = ["third_party"],
+    visibility = ["//visibility:public"],
+)
+
+# ─── json_chunk_cpp ───────────────────────────────────────────────────────────
+cc_library(
+    name = "json_chunk_cpp",
+    srcs = [
+        "src/parser.cpp",
+        "src/chunk_parser.cpp",
+    ],
+    hdrs = [
+        "include/parser.hpp",
+        "include/chunk_parser.hpp",
+    ],
+    includes = ["include"],
+    copts = ["-std=c++17"],
+    deps = [":nlohmann_json"],
+    visibility = ["//visibility:public"],
+)
+
+# ─── Tests ────────────────────────────────────────────────────────────────────
+cc_test(
+    name = "chunk_parser_tests",
+    srcs = [
+        "tests/chunk_parser_tests.cpp",
+        "tests/test_helpers.hpp",
+    ],
+    includes = ["tests"],
+    copts = ["-std=c++17"],
+    deps = [":json_chunk_cpp"],
+)
